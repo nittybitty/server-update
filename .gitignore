@@ -1,0 +1,5 @@
+# Actual server list with real IPs
+server_list.txt
+
+# Log files may contain sensitive information
+*.log

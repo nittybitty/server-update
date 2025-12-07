@@ -1,0 +1,19 @@
+# Format: nickname ipaddress [-p port]
+# One server per line
+
+# Production web server (default port 22)
+web-prod 192.0.2.10
+
+# Production database server (custom SSH port)
+db-prod 192.0.2.20 -p 2222
+
+# Application server (custom SSH port)
+app-server 192.0.2.25 -p 22022
+
+# Staging server (commented out)
+#web-staging 192.0.2.30 -p 2222
+
+# Add your servers here, one per line
+# Comments start with #
+# Empty lines are ignored
+# Port specification is optional (defaults to port 22)
