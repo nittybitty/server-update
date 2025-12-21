@@ -3,3 +3,11 @@ server_list.txt
 
 # Log files may contain sensitive information
 *.log
+
+# Testing and fuzzing artifacts
+fuzz_test.bash
+fuzz_results.txt
+fuzz_test_tmp/
+
+# Python virtual environment
+venv/

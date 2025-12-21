@@ -40,10 +40,11 @@ declare -A SERVER_KERNEL              # server -> kernel version
 
 The script operates in distinct phases:
 
-#### **Startup (lines ~845-858)**
+#### **Startup (lines ~980-998)**
 - Displays list of all servers to be checked
 - Shows total server count
 - Waits for user to press Enter to begin
+- **Exception**: In automated modes (`--non-interactive`, `--check-only`, `--assume-yes`), skips the Enter prompt
 
 #### **Phase 1: Discovery & System Detection (lines ~860-884)**
 - Connects to all servers **in parallel** using background jobs
@@ -71,6 +72,7 @@ The script operates in distinct phases:
     - `--dry-run`: Skip all updates
     - `--check-only`: Display only, don't prompt
     - `--assume-yes`: Auto-approve all
+    - `--non-interactive`: Skips all interactive prompts
   - Approved servers written to `$TEMP_DIR/approved_servers.txt`
 
 #### **Phase 3: Parallel Execution (lines ~1031-1056)**
@@ -108,11 +110,13 @@ This phase is specifically designed to safely update the local server (localhost
   - ⚠️ Local server will reboot
   - ⚠️ You will lose your session
 - **First user confirmation**: "Proceed with local server update? [y/N]"
+  - In `--non-interactive` mode: Auto-approves if `--assume-yes` is also set, otherwise skips
 - If approved:
   - Runs appropriate update command (apt/dnf/yum)
   - Detects if kernel was updated
   - If kernel updated:
     - **Second user confirmation**: "Reboot local server now? [y/N]"
+      - In `--non-interactive` mode: Auto-approves if `--assume-yes` is also set, otherwise skips
     - If approved: 5-second countdown, then `sudo reboot`
     - If declined: Reminds user to reboot manually later
 - All decisions logged to `$LOG_FILE`
@@ -240,11 +244,12 @@ Returns:
 ```bash
 ./server_update.bash [OPTIONS]
 
---dry-run       # Check for updates but don't apply them
---check-only    # Display updates without prompting
---assume-yes    # Auto-approve all updates (dangerous!)
---help, -h      # Display usage information
---version       # Display version
+--dry-run          # Check for updates but don't apply them
+--check-only       # Display updates without prompting
+--assume-yes       # Auto-approve all updates (dangerous!)
+--non-interactive  # Skip all interactive prompts (for automation/testing)
+--help, -h         # Display usage information
+--version          # Display version
 ```
 
 ### Configuration File (server_update.conf)
@@ -289,10 +294,12 @@ Validation performed during parsing (lines 276-352):
 - `validate_port()`: Ensures port is 1-65535
 - `validate_ip()`: Validates IPv4 and basic IPv6
 
-### Safe Configuration Loading (lines 37-99)
+### Safe Configuration Loading (lines 37-107)
 - Whitelisted variables only
-- Numeric value validation
-- Regex pattern testing
+- Numeric value validation with maximum caps (604800 seconds = 1 week)
+- **ReDoS protection**: Regex patterns tested with 1-second timeout to prevent catastrophic backtracking
+- **Integer overflow protection**: Rejects values exceeding 604800 seconds
+- Regex pattern syntax validation
 - No arbitrary code execution via `source`
 
 ### File Permissions
@@ -370,8 +377,8 @@ Log file created with 600 permissions. Warns if log exceeds 10MB.
 - **Multi-distribution support**: apt/dnf/yum auto-detection
 - **Enhanced dashboard**: Compact table format showing OS release, kernel version, and status on one line per server
 - **Phase 4: Local server updates**: Safely updates localhost AFTER all remote servers with two-stage confirmation
-- **Security improvements**: Input validation, safe config parsing, secure permissions
-- **New command-line options**: --check-only, --assume-yes, --help, --version
+- **Security improvements**: Input validation, safe config parsing, ReDoS protection, integer overflow protection, secure permissions
+- **New command-line options**: --check-only, --assume-yes, --non-interactive, --help, --version
 - **Code quality**: Comprehensive documentation, helper functions, reduced redundancy
 - **Better error handling**: Connection failures don't stop execution
 - **Configurable dashboard refresh rate**

@@ -53,6 +53,8 @@ For each server with available updates:
 ### 🔒 Security Enhancements
 - **Input validation** prevents command injection attacks
 - **Safe config file parsing** with whitelisted variables only
+- **ReDoS protection** prevents regex-based denial of service attacks
+- **Integer overflow protection** rejects unreasonably large timeout values
 - **Secure file permissions**: temp dirs (700), logs (600)
 - **Permission warnings** for world-writable config/server list files
 - All variable expansions properly quoted
@@ -84,6 +86,7 @@ cd /root/server-update
 | `--dry-run` | Check for updates but don't apply them |
 | `--check-only` | Display available updates without prompting for approval |
 | `--assume-yes` | Automatically approve all updates (use with caution!) |
+| `--non-interactive` | Skip all interactive prompts (for automation/testing) |
 | `--help`, `-h` | Display usage information |
 | `--version` | Display version information |
 
@@ -122,6 +125,16 @@ cd /root/server-update
 - Does not apply any changes
 - Safe for testing
 
+**Non-Interactive Mode**
+```bash
+./server_update.bash --non-interactive --assume-yes
+```
+- Skips all interactive prompts (no "Press Enter", no confirmation prompts)
+- Useful for automation, CI/CD pipelines, and fuzzing/testing
+- Combines with `--assume-yes` to fully automate updates
+- Without `--assume-yes`, will check but not apply updates
+- Localhost updates require `--assume-yes` to proceed automatically
+
 ## Configuration
 
 ### Optional Configuration File
@@ -157,8 +170,10 @@ KERNEL_UPDATE_REGEX="(Installing|Upgrading).*(kernel-core|kernel-modules|kernel)
 
 **Security Notes:**
 - Config file is parsed safely with whitelisted variables only
-- Values are validated before use (numeric checks, regex validation)
+- Values are validated before use (numeric checks, regex validation with timeout)
 - Script will warn if config file has unsafe permissions
+- ReDoS protection: Regex patterns are tested with 1-second timeout
+- Integer overflow protection: Values capped at 604800 seconds (1 week)
 
 ## Server List Format
 
@@ -300,6 +315,8 @@ The script automatically detects and supports:
 ### Security Improvements
 - ✅ **Input validation** prevents command injection attacks
 - ✅ **Safe configuration parsing** with whitelisted variables
+- ✅ **ReDoS protection** prevents catastrophic backtracking in regex patterns
+- ✅ **Integer overflow protection** caps timeout values at 1 week maximum
 - ✅ **Secure file permissions** (700 for temp, 600 for logs)
 - ✅ **Permission warnings** for insecure config files
 - ✅ **No arbitrary code execution** vulnerabilities
@@ -310,6 +327,7 @@ The script automatically detects and supports:
 - ✅ **Two-stage confirmation** for local updates and reboots
 - ✅ **--check-only mode** for auditing
 - ✅ **--assume-yes mode** for automation
+- ✅ **--non-interactive mode** for complete automation and testing
 - ✅ **--help and --version** flags
 - ✅ **Configurable dashboard refresh rate**
 - ✅ **Compact table dashboard** - One line per server showing OS, kernel, and status

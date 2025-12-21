@@ -18,7 +18,6 @@ NC='\033[0m' # No Color
 # Configuration
 SERVER_LIST="server_list.txt"
 LOG_FILE="server_update.log"
-SSH_CMD="ssh -o ConnectTimeout=10"
 
 # Default values for configurable variables
 # DNF_TIMEOUT: Maximum time (seconds) to wait for dnf commands to complete (default: 600 = 10 minutes)
@@ -77,15 +76,23 @@ load_config() {
                         echo -e "${YELLOW}[WARNING]${NC} Invalid numeric value for $key in config file. Using default."
                         continue
                     fi
+                    # Reject unreasonably large values (1 week = 604800 seconds max)
+                    if [[ "$value" -gt 604800 ]]; then
+                        echo -e "${YELLOW}[WARNING]${NC} Value for $key is too large (max: 604800 seconds). Using default."
+                        continue
+                    fi
                 fi
 
-                # Validate regex patterns by testing syntax (grep returns 0-1 for valid regex, 2+ for syntax errors)
+                # Validate regex patterns with ReDoS protection
                 if [[ "$key" =~ REGEX ]]; then
-                    printf "" | grep -E "$value" >/dev/null 2>&1
-                    regex_exit=$?
-                    if [[ $regex_exit -ge 2 ]]; then
-                        echo -e "${YELLOW}[WARNING]${NC} Invalid regex pattern for $key in config file. Using default."
-                        continue
+                    # Test regex with timeout to prevent catastrophic backtracking
+                    if ! timeout 1s bash -c "echo 'kernel-core-5.14.0' | grep -E '$value' >/dev/null 2>&1"; then
+                        regex_exit=$?
+                        # Exit codes: 0=match, 1=no match, 2+=error, 124=timeout
+                        if [[ $regex_exit -ge 2 || $regex_exit -eq 124 ]]; then
+                            echo -e "${YELLOW}[WARNING]${NC} Invalid or dangerous regex pattern for $key in config file. Using default."
+                            continue
+                        fi
                     fi
                 fi
 
@@ -160,8 +167,8 @@ validate_ip() {
 
     # IPv4 validation
     if [[ "$ip" =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]]; then
-        local IFS='.'
-        local -a octets=($ip)
+        local -a octets
+        IFS='.' read -ra octets <<< "$ip"
         for octet in "${octets[@]}"; do
             if [[ "$octet" -gt 255 ]]; then
                 return 1
@@ -188,6 +195,7 @@ show_help() {
     echo "  --dry-run          Check for updates but don't apply them"
     echo "  --check-only       Display available updates without prompting"
     echo "  --assume-yes       Automatically approve all updates (use with caution)"
+    echo "  --non-interactive  Skip all interactive prompts (for automation/testing)"
     echo "  --version          Display version information"
     echo "  --help             Display this help message"
     echo ""
@@ -211,6 +219,7 @@ show_version() {
 DRY_RUN=false
 CHECK_ONLY=false
 ASSUME_YES=false
+NON_INTERACTIVE=false
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -229,6 +238,10 @@ while [[ $# -gt 0 ]]; do
             echo -e "${YELLOW}Running with --assume-yes. All updates will be auto-approved!${NC}\n"
             shift
             ;;
+        --non-interactive)
+            NON_INTERACTIVE=true
+            shift
+            ;;
         --version)
             show_version
             ;;
@@ -245,8 +258,26 @@ done
 
 
 
-# Cleanup on exit - remove temporary directory
-trap 'rm -rf "$TEMP_DIR"' EXIT
+# Cleanup function to run on exit
+cleanup() {
+    # Kill all background jobs spawned by this script
+    # This prevents orphaned dnf/yum processes that can hang future runs
+    local jobs_list
+    jobs_list=$(jobs -p 2>/dev/null)
+    if [[ -n "$jobs_list" ]]; then
+        # Kill background jobs and their children
+        echo "$jobs_list" | xargs -r kill -TERM 2>/dev/null
+        sleep 1
+        # Force kill any remaining processes
+        echo "$jobs_list" | xargs -r kill -KILL 2>/dev/null || true
+    fi
+
+    # Remove temporary directory
+    rm -rf "$TEMP_DIR"
+}
+
+# Cleanup on exit - kill background jobs and remove temporary directory
+trap cleanup EXIT INT TERM
 
 # Initialize log file with restricted permissions (600 - owner read/write only)
 touch "$LOG_FILE" 2>/dev/null
@@ -281,9 +312,6 @@ fi
 declare -a SERVERS
 declare -A SERVER_NICKNAMES
 declare -A SERVER_PORTS
-declare -A SERVER_PKG_MANAGER
-declare -A SERVER_OS_RELEASE
-declare -A SERVER_KERNEL
 line_number=0
 
 while read -r -a parts; do
@@ -406,7 +434,7 @@ gather_system_info() {
             os_info=$($ssh_cmd "$server" "lsb_release -d 2>/dev/null | cut -f2" 2>/dev/null || echo "Unknown")
         fi
     else
-        os_info=$(cat /etc/os-release 2>/dev/null | grep '^PRETTY_NAME=' | cut -d'"' -f2 || echo "Unknown")
+        os_info=$(grep '^PRETTY_NAME=' /etc/os-release 2>/dev/null | cut -d'"' -f2 || echo "Unknown")
     fi
 
     # Get kernel version
@@ -434,13 +462,27 @@ get_ssh_cmd() {
         return
     fi
 
-    local port_arg=""
+    # Build SSH command with proper quoting
+    local ssh_cmd="ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10"
+
     if [[ -n "${SERVER_PORTS[$server]}" ]]; then
-        port_arg="-p ${SERVER_PORTS[$server]}"
+        # Append port with proper quoting
+        ssh_cmd="$ssh_cmd -p ${SERVER_PORTS[$server]}"
     fi
 
-    # Include StrictHostKeyChecking=no for automated updates (as documented in CLAUDE.md)
-    echo "ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 $port_arg"
+    echo "$ssh_cmd"
+}
+
+# Function to test if sudo works without password on localhost
+# Returns: 0 if passwordless sudo works, 1 otherwise
+test_localhost_sudo() {
+    # Use a short timeout (5 seconds) to test if sudo requires password
+    # sudo -n (non-interactive) will fail immediately if password is required
+    if timeout 5s sudo -n true 2>/dev/null; then
+        return 0
+    else
+        return 1
+    fi
 }
 
 # Function to execute command on remote server or locally
@@ -454,8 +496,16 @@ execute_remote_command() {
     ssh_cmd=$(get_ssh_cmd "$server")
 
     if [[ -n "$ssh_cmd" ]]; then
+        # shellcheck disable=SC2086
         timeout "${timeout}s" $ssh_cmd "$server" "$command" 2>&1
     else
+        # For localhost, test if sudo works first (only if command contains sudo)
+        if [[ "$command" == *"sudo"* ]]; then
+            if ! test_localhost_sudo; then
+                echo "ERROR: Passwordless sudo is not configured for localhost"
+                return 1
+            fi
+        fi
         timeout "${timeout}s" bash -c "$command" 2>&1
     fi
 
@@ -611,9 +661,17 @@ check_server_updates() {
 
     # Test SSH connection before proceeding (skip for localhost)
     if [[ -n "$ssh_cmd" ]]; then
-        if ! $ssh_cmd "$server" "echo 'Connection successful'" &>/dev/null; then
-            update_status "$server" "ERROR: Cannot connect"
-            echo "$(date) - ERROR: Connection failed to $server" >> "$LOG_FILE"
+        # Use timeout to prevent hanging on connection attempts
+        # shellcheck disable=SC2086
+        if ! timeout 15s $ssh_cmd "$server" "echo 'Connection successful'" &>/dev/null; then
+            local exit_code=$?
+            if [[ $exit_code -eq 124 ]]; then
+                update_status "$server" "ERROR: Connection timeout"
+                echo "$(date) - ERROR: Connection timeout to $server (15s)" >> "$LOG_FILE"
+            else
+                update_status "$server" "ERROR: Cannot connect"
+                echo "$(date) - ERROR: Connection failed to $server" >> "$LOG_FILE"
+            fi
             return 1
         fi
     fi
@@ -655,11 +713,30 @@ check_server_updates() {
     pkg_output=$(execute_remote_command "$server" "$check_cmd")
     pkg_exit_code=$?
 
+    # Check for sudo error on localhost
+    if [[ "$pkg_output" == *"Passwordless sudo is not configured"* ]]; then
+        update_status "$server" "ERROR: Passwordless sudo required"
+        echo "$(date) - ERROR: Passwordless sudo not configured for $server" >> "$LOG_FILE"
+        echo "$(date) - NOTE: Configure passwordless sudo for package management commands" >> "$LOG_FILE"
+        return 1
+    fi
+
     # Check for timeout (exit code 124)
     if [[ $pkg_exit_code -eq 124 ]]; then
         update_status "$server" "ERROR: Package manager command timed out"
         echo "$(date) - ERROR: Package manager timed out on $server" >> "$LOG_FILE"
         return 1
+    fi
+
+    # Check for general command failure
+    if [[ $pkg_exit_code -ne 0 ]] && [[ "$pkg_manager" == "apt" ]]; then
+        # For apt, non-zero exit during update check might still be okay if we get output
+        # apt list --upgradable returns non-zero sometimes even when successful
+        if [[ -z "$pkg_output" ]]; then
+            update_status "$server" "ERROR: Package manager command failed"
+            echo "$(date) - ERROR: Package manager failed on $server (exit code: $pkg_exit_code)" >> "$LOG_FILE"
+            return 1
+        fi
     fi
 
     # Save full output to file for later review
@@ -831,6 +908,13 @@ apply_updates() {
     update_output=$(execute_remote_command "$server" "$update_cmd")
     local update_exit_code=$?
 
+    # Check for sudo error on localhost
+    if [[ "$update_output" == *"Passwordless sudo is not configured"* ]]; then
+        update_status "$server" "ERROR: Passwordless sudo required"
+        echo "$(date) - ERROR: Passwordless sudo not configured for $server" >> "$LOG_FILE"
+        return 1
+    fi
+
     # Check for timeout
     if [[ $update_exit_code -eq 124 ]]; then
         update_status "$server" "ERROR: Update command timed out"
@@ -906,8 +990,13 @@ for server in "${SERVERS[@]}"; do
 done
 echo ""
 
-echo -e "${CYAN}Press Enter to start checking for updates...${NC}"
-read -r
+# Skip interactive prompt in automated modes
+if [[ "$NON_INTERACTIVE" == true || "$CHECK_ONLY" == true || "$ASSUME_YES" == true ]]; then
+    echo -e "${CYAN}Starting update check (automated mode)...${NC}"
+else
+    echo -e "${CYAN}Press Enter to start checking for updates...${NC}"
+    read -r
+fi
 
 # ============================================================================
 # PHASE 1: Check all servers for updates in parallel
@@ -999,7 +1088,7 @@ for server in "${SERVERS[@]}"; do
     case "$pkg_manager" in
         apt)
             # For apt, display the upgradeable packages list
-            cat "$output_file" | grep -v "Listing..." | while read -r line; do
+            grep -v "Listing..." "$output_file" | while read -r line; do
                 if has_kernel_package "$line" "apt"; then
                     echo -e "${RED}${BOLD}$line${NC}"
                 else
@@ -1245,7 +1334,7 @@ if [[ "$localhost_has_updates" == "true" ]]; then
 
         case "$pkg_manager" in
             apt)
-                cat "$TEMP_DIR/localhost.output" | grep -v "Listing..." | head -20
+                grep -v "Listing..." "$TEMP_DIR/localhost.output" | head -20
                 ;;
             dnf|yum)
                 sed -n '/^Upgrading:/,/^Transaction Summary/p' "$TEMP_DIR/localhost.output" | head -20
@@ -1266,13 +1355,29 @@ if [[ "$localhost_has_updates" == "true" ]]; then
         fi
     fi
 
-    # Prompt for confirmation
-    echo -e "${BOLD}${YELLOW}════════════════════════════════════════════════════════════════════════════════${NC}"
-    echo -e -n "${BOLD}${YELLOW}Proceed with local server update? [y/N]: ${NC}"
-    read -r response
-    echo ""
+    # Prompt for confirmation (or auto-approve in non-interactive mode with assume-yes)
+    proceed=false
+    if [[ "$NON_INTERACTIVE" == true ]]; then
+        if [[ "$ASSUME_YES" == true ]]; then
+            echo -e "${GREEN}Auto-approving local server update (--non-interactive --assume-yes mode)${NC}"
+            echo ""
+            proceed=true
+        else
+            echo -e "${YELLOW}Skipping local server update (--non-interactive mode without --assume-yes)${NC}"
+            echo ""
+            proceed=false
+        fi
+    else
+        echo -e "${BOLD}${YELLOW}════════════════════════════════════════════════════════════════════════════════${NC}"
+        echo -e -n "${BOLD}${YELLOW}Proceed with local server update? [y/N]: ${NC}"
+        read -r response
+        echo ""
+        if [[ "$response" =~ ^[Yy]$ ]]; then
+            proceed=true
+        fi
+    fi
 
-    if [[ "$response" =~ ^[Yy]$ ]]; then
+    if [[ "$proceed" == "true" ]]; then
         echo -e "${GREEN}Updating local server...${NC}"
         echo ""
 
@@ -1342,11 +1447,27 @@ if [[ "$localhost_has_updates" == "true" ]]; then
                 echo -e "${YELLOW}${BOLD}════════════════════════════════════════════════════════════════════════════════${NC}"
                 echo ""
                 echo -e "${YELLOW}The local server kernel has been updated and requires a reboot.${NC}"
-                echo ""
-                echo -e -n "${BOLD}${RED}Reboot local server now? [y/N]: ${NC}"
-                read -r reboot_response
+                do_reboot=false
+                if [[ "$NON_INTERACTIVE" == true ]]; then
+                    if [[ "$ASSUME_YES" == true ]]; then
+                        echo ""
+                        echo -e "${GREEN}Auto-approving reboot (--non-interactive --assume-yes mode)${NC}"
+                        do_reboot=true
+                    else
+                        echo ""
+                        echo -e "${YELLOW}Skipping reboot (--non-interactive mode without --assume-yes)${NC}"
+                        do_reboot=false
+                    fi
+                else
+                    echo ""
+                    echo -e -n "${BOLD}${RED}Reboot local server now? [y/N]: ${NC}"
+                    read -r reboot_response
+                    if [[ "$reboot_response" =~ ^[Yy]$ ]]; then
+                        do_reboot=true
+                    fi
+                fi
 
-                if [[ "$reboot_response" =~ ^[Yy]$ ]]; then
+                if [[ "$do_reboot" == "true" ]]; then
                     echo ""
                     echo -e "${RED}${BOLD}Rebooting local server in 5 seconds...${NC}"
                     echo -e "${YELLOW}This script will terminate. Remote servers are already updated.${NC}"
