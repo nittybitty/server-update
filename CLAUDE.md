@@ -168,8 +168,8 @@ The `draw_dashboard()` function (lines ~510-587) renders the live status display
 ```
 SERVER                         OS DISTRIBUTION                  KERNEL VERSION               STATUS
 ────────────────────────────────────────────────────────────────────────────────────────────────────────────
-192.0.2.10 (web-prod)   Rocky Linux 9.3 (Blue Onyx)      5.14.0-362.24.1.el9_3.x86_64 5 updates available
-192.0.2.20 (db-prod)    Ubuntu 22.04.3 LTS               5.15.0-91-generic            Applying updates (apt)...
+192.0.2.10 (web-prod)          Rocky Linux 9.3 (Blue Onyx)      5.14.0-362.24.1.el9_3.x86_64 5 updates available
+192.0.2.20 (db-prod)           Ubuntu 22.04.3 LTS               5.15.0-91-generic            Applying updates (apt)...
 ```
 
 **Column Widths:**
