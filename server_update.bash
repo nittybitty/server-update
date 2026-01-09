@@ -1,9 +1,12 @@
 #!/bin/bash
 
+# Set restrictive umask to prevent world-readable temp files (Fix: Issue #42)
+umask 077
+
 # To update the local server, add a line like "local localhost" to your server_list.txt file.
 
 # Server Update Dashboard
-# Version: 1.1
+# Version: 1.3
 
 # Color definitions for output
 RED='\033[0;31m'
@@ -18,6 +21,7 @@ NC='\033[0m' # No Color
 # Configuration
 SERVER_LIST="server_list.txt"
 LOG_FILE="server_update.log"
+LOCK_FILE="/tmp/server_update.lock"
 
 # Default values for configurable variables
 # DNF_TIMEOUT: Maximum time (seconds) to wait for dnf commands to complete (default: 600 = 10 minutes)
@@ -107,6 +111,36 @@ load_config() {
 # Load configuration safely
 load_config
 
+# ============================================================================
+# INSTANCE LOCKING - Prevent multiple instances from running simultaneously
+# ============================================================================
+# Check if another instance is already running
+if [[ -f "$LOCK_FILE" ]]; then
+    # Read PID from lock file
+    existing_pid=$(cat "$LOCK_FILE" 2>/dev/null)
+
+    # Check if that PID is still running
+    if [[ -n "$existing_pid" ]] && kill -0 "$existing_pid" 2>/dev/null; then
+        echo -e "${RED}[ERROR]${NC} Another instance of this script is already running (PID: $existing_pid)"
+        echo -e "${RED}[ERROR]${NC} Lock file: $LOCK_FILE"
+        echo -e "${YELLOW}[INFO]${NC} If you're sure no other instance is running, remove the lock file:"
+        echo -e "${YELLOW}[INFO]${NC}   rm $LOCK_FILE"
+        exit 1
+    else
+        # Stale lock file (process no longer exists)
+        echo -e "${YELLOW}[WARNING]${NC} Removing stale lock file from PID $existing_pid"
+        rm -f "$LOCK_FILE"
+    fi
+fi
+
+# Create lock file with our PID
+echo $$ > "$LOCK_FILE"
+if [[ $? -ne 0 ]]; then
+    echo -e "${RED}[ERROR]${NC} Failed to create lock file: $LOCK_FILE"
+    echo -e "${YELLOW}[INFO]${NC} Check permissions on /tmp directory"
+    exit 1
+fi
+
 # Create temporary directory with secure permissions (700 - owner only)
 TEMP_DIR=$(mktemp -d /tmp/server_update.XXXXXX)
 if [[ ! -d "$TEMP_DIR" ]]; then
@@ -114,6 +148,11 @@ if [[ ! -d "$TEMP_DIR" ]]; then
     exit 1
 fi
 chmod 700 "$TEMP_DIR"
+
+# Create SSH control socket directory (Fix: Issue #3 - SSH connection pooling)
+SSH_CONTROL_DIR="$TEMP_DIR/ssh_control"
+mkdir -p "$SSH_CONTROL_DIR"
+chmod 700 "$SSH_CONTROL_DIR"
 
 # Function to validate server name/IP to prevent command injection
 # Parameters: $1 = server name or IP address
@@ -185,9 +224,56 @@ validate_ip() {
     return 1
 }
 
+# ============================================================================
+# FILE LOCKING UTILITIES - Prevent race conditions with temp file access
+# ============================================================================
+# These functions use flock to ensure atomic reads/writes to temp files
+# This prevents corruption when multiple background processes access the same files
+
+# Function to safely write to a file with flock protection
+# Parameters: $1 = file path, $2 = content to write
+# Returns: 0 on success, 1 on failure
+safe_write_file() {
+    local file_path="$1"
+    local content="$2"
+
+    # Use flock to get exclusive lock, then write atomically
+    # File descriptor 200 is arbitrary but consistent
+    {
+        flock -x 200 || return 1
+        echo "$content" > "$file_path"
+    } 200>"${file_path}.lock" 2>/dev/null
+
+    return $?
+}
+
+# Function to safely read from a file with flock protection
+# Parameters: $1 = file path, $2 = default value if file doesn't exist (optional)
+# Returns: File content via stdout, or default value if file doesn't exist
+safe_read_file() {
+    local file_path="$1"
+    local default_value="${2:-}"
+
+    # If file doesn't exist, return default value
+    if [[ ! -f "$file_path" ]]; then
+        echo "$default_value"
+        return 0
+    fi
+
+    # Use flock to get shared lock, then read
+    local content
+    {
+        flock -s 200 || return 1
+        content=$(cat "$file_path" 2>/dev/null || echo "$default_value")
+    } 200>"${file_path}.lock" 2>/dev/null
+
+    echo "$content"
+    return 0
+}
+
 # Function to display usage information
 show_help() {
-    echo "Server Update Dashboard - Version 1.1"
+    echo "Server Update Dashboard - Version 1.3"
     echo ""
     echo "Usage: $0 [OPTIONS]"
     echo ""
@@ -211,7 +297,7 @@ show_help() {
 # Function to display version information
 show_version() {
     echo "Server Update Dashboard"
-    echo "Version: 1.1"
+    echo "Version: 1.3"
     exit 0
 }
 
@@ -260,6 +346,15 @@ done
 
 # Cleanup function to run on exit
 cleanup() {
+    # Close all SSH control connections (Fix: Issue #3)
+    if [[ -d "$SSH_CONTROL_DIR" ]]; then
+        for socket in "$SSH_CONTROL_DIR"/*; do
+            if [[ -S "$socket" ]]; then
+                ssh -O exit -o ControlPath="$socket" 2>/dev/null || true
+            fi
+        done
+    fi
+
     # Kill all background jobs spawned by this script
     # This prevents orphaned dnf/yum processes that can hang future runs
     local jobs_list
@@ -274,6 +369,9 @@ cleanup() {
 
     # Remove temporary directory
     rm -rf "$TEMP_DIR"
+
+    # Remove instance lock file
+    rm -f "$LOCK_FILE"
 }
 
 # Cleanup on exit - kill background jobs and remove temporary directory
@@ -446,8 +544,8 @@ gather_system_info() {
     fi
 
     # Write to temp files so background processes can share this info
-    echo "$os_info" > "$TEMP_DIR/${server}.os_release"
-    echo "$kernel_ver" > "$TEMP_DIR/${server}.kernel"
+    safe_write_file "$TEMP_DIR/${server}.os_release" "$os_info"
+    safe_write_file "$TEMP_DIR/${server}.kernel" "$kernel_ver"
 }
 
 # Function to get SSH command with port and options
@@ -456,14 +554,20 @@ gather_system_info() {
 get_ssh_cmd() {
     local server="$1"
 
-    # For localhost, don't use SSH
-    if [[ "$server" == "localhost" ]]; then
+    # For localhost, don't use SSH (Fix: Issue #28 - better localhost detection)
+    # Check if server is truly localhost (127.0.0.1, ::1, or localhost)
+    if [[ "$server" == "localhost" || "$server" == "127.0.0.1" || "$server" == "::1" ]]; then
         echo ""
         return
     fi
 
-    # Build SSH command with proper quoting
-    local ssh_cmd="ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10"
+    # Build SSH command with connection pooling and better security (Fix: Issues #3, #41)
+    # ControlMaster=auto: Reuse existing connections when available
+    # ControlPersist=600: Keep connection alive for 10 minutes after last use
+    # ControlPath: Socket file for connection sharing
+    # StrictHostKeyChecking=accept-new: Accept new hosts but verify known hosts (more secure than 'no')
+    local control_socket="$SSH_CONTROL_DIR/${server}_%h_%p_%r"
+    local ssh_cmd="ssh -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 -o ControlMaster=auto -o ControlPersist=600 -o ControlPath=\"$control_socket\""
 
     if [[ -n "${SERVER_PORTS[$server]}" ]]; then
         # Append port with proper quoting
@@ -510,6 +614,54 @@ execute_remote_command() {
     fi
 
     return $?
+}
+
+# Function to check disk space before updates (Fix: Issue #7)
+# Parameters: $1 = server address
+# Returns: 0 if sufficient space, 1 if insufficient
+check_disk_space() {
+    local server="$1"
+    local ssh_cmd
+    ssh_cmd=$(get_ssh_cmd "$server")
+
+    # Get disk space for / and /boot partitions
+    # df output format: Filesystem Size Used Avail Use% Mounted
+    local root_avail boot_avail
+
+    if [[ -n "$ssh_cmd" ]]; then
+        # shellcheck disable=SC2086
+        root_avail=$($ssh_cmd "$server" "df -BG / | tail -1 | awk '{print \$4}' | sed 's/G//'" 2>/dev/null)
+        # shellcheck disable=SC2086
+        boot_avail=$($ssh_cmd "$server" "df -BM /boot 2>/dev/null | tail -1 | awk '{print \$4}' | sed 's/M//'" 2>/dev/null)
+    else
+        root_avail=$(df -BG / | tail -1 | awk '{print $4}' | sed 's/G//')
+        boot_avail=$(df -BM /boot 2>/dev/null | tail -1 | awk '{print $4}' | sed 's/M//' 2>/dev/null)
+    fi
+
+    # Check if we got valid numbers
+    if [[ ! "$root_avail" =~ ^[0-9]+$ ]]; then
+        echo -e "${YELLOW}[WARNING]${NC} Could not determine disk space for / on $(get_display_name "$server")"
+        return 0  # Allow to proceed if we can't check (non-fatal)
+    fi
+
+    # Require at least 10GB free on /
+    if [[ "$root_avail" -lt 10 ]]; then
+        echo -e "${RED}[ERROR]${NC} Insufficient disk space on / for $(get_display_name "$server")"
+        echo -e "${RED}[ERROR]${NC} Available: ${root_avail}GB, Required: 10GB"
+        return 1
+    fi
+
+    # Check /boot if it exists as a separate partition (non-fatal if it doesn't exist)
+    if [[ -n "$boot_avail" && "$boot_avail" =~ ^[0-9]+$ ]]; then
+        # Require at least 500MB free on /boot
+        if [[ "$boot_avail" -lt 500 ]]; then
+            echo -e "${RED}[ERROR]${NC} Insufficient disk space on /boot for $(get_display_name "$server")"
+            echo -e "${RED}[ERROR]${NC} Available: ${boot_avail}MB, Required: 500MB"
+            return 1
+        fi
+    fi
+
+    return 0
 }
 
 # Function to format server display name
@@ -565,24 +717,22 @@ draw_dashboard() {
     # Clear screen
     printf "\033[H\033[2J"
 
-    # Draw header
-    echo -e "${BOLD}${BLUE}╔══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════╗${NC}"
-    echo -e "${BOLD}${BLUE}║                                                            SERVER UPDATE DASHBOARD                                                                                  ║${NC}"
-    echo -e "${BOLD}${BLUE}╚══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════╝${NC}"
+    # Draw header (Fix: Issue #36 - Use ASCII instead of Unicode)
+    echo -e "${BOLD}${BLUE}+==================================================================================================================================+${NC}"
+    echo -e "${BOLD}${BLUE}|                                        SERVER UPDATE DASHBOARD                                                                  |${NC}"
+    echo -e "${BOLD}${BLUE}+==================================================================================================================================+${NC}"
 
     # Column headers
     printf "\n${BOLD}%-30s %-32s %-28s %-40s${NC}\n" "SERVER" "OS DISTRIBUTION" "KERNEL VERSION" "STATUS"
-    echo -e "${BLUE}────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────${NC}"
+    echo -e "${BLUE}----------------------------------------------------------------------------------------------------------------------------------${NC}"
 
     # Display status for each server
     for server in "${SERVERS[@]}"; do
         local status_file="$TEMP_DIR/${server}.status"
-        local status="Pending"
 
-        # Read status file if it exists (with error handling)
-        if [[ -f "$status_file" ]]; then
-            status=$(cat "$status_file" 2>/dev/null || echo "Error reading status")
-        fi
+        # Read status file with flock protection
+        local status
+        status=$(safe_read_file "$status_file" "Pending")
 
         # Color code status based on keywords
         local color="${CYAN}"
@@ -601,21 +751,16 @@ draw_dashboard() {
         local display_name
         display_name=$(get_display_name "$server")
 
-        # Get OS and kernel info from temp files
-        local os_info="--"
-        local kernel_info="--"
+        # Get OS and kernel info from temp files with flock protection
+        local os_info
+        local kernel_info
 
-        if [[ -f "$TEMP_DIR/${server}.os_release" ]]; then
-            os_info=$(cat "$TEMP_DIR/${server}.os_release" 2>/dev/null || echo "--")
-            # Don't show "Unknown"
-            [[ "$os_info" == "Unknown" ]] && os_info="--"
-        fi
+        os_info=$(safe_read_file "$TEMP_DIR/${server}.os_release" "--")
+        kernel_info=$(safe_read_file "$TEMP_DIR/${server}.kernel" "--")
 
-        if [[ -f "$TEMP_DIR/${server}.kernel" ]]; then
-            kernel_info=$(cat "$TEMP_DIR/${server}.kernel" 2>/dev/null || echo "--")
-            # Don't show "Unknown"
-            [[ "$kernel_info" == "Unknown" ]] && kernel_info="--"
-        fi
+        # Don't show "Unknown"
+        [[ "$os_info" == "Unknown" ]] && os_info="--"
+        [[ "$kernel_info" == "Unknown" ]] && kernel_info="--"
 
         # Truncate fields if too long
         if [[ ${#display_name} -gt 29 ]]; then
@@ -635,7 +780,7 @@ draw_dashboard() {
         printf "%-30s %-32s %-28s ${color}%-40s${NC}\n" "$display_name" "$os_info" "$kernel_info" "$status"
     done
 
-    echo -e "${BLUE}────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────${NC}"
+    echo -e "${BLUE}----------------------------------------------------------------------------------------------------------------------------------${NC}"
 }
 
 # Function to update server status in temporary file (read by draw_dashboard)
@@ -643,7 +788,7 @@ draw_dashboard() {
 update_status() {
     local server="$1"
     local status="$2"
-    echo "$status" > "$TEMP_DIR/${server}.status"
+    safe_write_file "$TEMP_DIR/${server}.status" "$status"
 }
 
 # Function to check for available updates on a server
@@ -682,7 +827,7 @@ check_server_updates() {
     local pkg_manager
     pkg_manager=$(detect_package_manager "$server")
     # Write to temp file (background processes can't modify parent arrays)
-    echo "$pkg_manager" > "$TEMP_DIR/${server}.pkg_manager"
+    safe_write_file "$TEMP_DIR/${server}.pkg_manager" "$pkg_manager"
     gather_system_info "$server"
 
     update_status "$server" "Connected - checking for updates ($pkg_manager)..."
@@ -746,8 +891,8 @@ check_server_updates() {
     local total_count=0
     case "$pkg_manager" in
         apt)
-            # Count upgradeable packages (excluding the "Listing..." header)
-            total_count=$(echo "$pkg_output" | grep -v "Listing..." | grep -c "/" || echo 0)
+            # Count upgradeable packages (excluding the "Listing..." header) (Fix: Issue #29)
+            total_count=$(echo "$pkg_output" | grep -v "^Listing\.\.\.$" | grep -c "/" || echo 0)
             if [[ $total_count -gt 0 ]]; then
                 update_status "$server" "${total_count} updates available"
                 return 0
@@ -817,7 +962,7 @@ verify_reboot() {
     if [[ -n "$ssh_cmd" && $down_attempts -ge $max_down_attempts ]]; then
         update_status "$server" "ERROR: Server did not go down after reboot command"
         echo "$(date) - ERROR: $server did not go down after reboot command" >> "$LOG_FILE"
-        echo "failed" > "$TEMP_DIR/${server}.reboot_status"
+        safe_write_file "$TEMP_DIR/${server}.reboot_status" "failed"
         return 1
     fi
 
@@ -849,7 +994,7 @@ verify_reboot() {
             # Server is back online and responsive!
             update_status "$server" "✓ Reboot complete"
             echo "$(date) - $server successfully rebooted after $((attempts * REBOOT_WAIT_INTERVAL)) seconds" >> "$LOG_FILE"
-            echo "success" > "$TEMP_DIR/${server}.reboot_status"
+            safe_write_file "$TEMP_DIR/${server}.reboot_status" "success"
             return 0
         fi
 
@@ -860,7 +1005,7 @@ verify_reboot() {
     # Timeout - server didn't come back within the maximum wait time
     update_status "$server" "ERROR: Server did not come back online after reboot"
     echo "$(date) - ERROR: $server did not come back online after ${REBOOT_MAX_WAIT}s" >> "$LOG_FILE"
-    echo "failed" > "$TEMP_DIR/${server}.reboot_status"
+    safe_write_file "$TEMP_DIR/${server}.reboot_status" "failed"
     return 1
 }
 
@@ -875,10 +1020,14 @@ apply_updates() {
     ssh_cmd=$(get_ssh_cmd "$server")
     # Read package manager from temp file (set during check_server_updates)
     local pkg_manager
-    if [[ -f "$TEMP_DIR/${server}.pkg_manager" ]]; then
-        pkg_manager=$(cat "$TEMP_DIR/${server}.pkg_manager" 2>/dev/null || echo "unknown")
-    else
-        pkg_manager="unknown"
+    pkg_manager=$(safe_read_file "$TEMP_DIR/${server}.pkg_manager" "unknown")
+
+    # Check disk space before applying updates (Fix: Issue #7)
+    update_status "$server" "Checking disk space..."
+    if ! check_disk_space "$server"; then
+        update_status "$server" "ERROR: Insufficient disk space"
+        echo "$(date) - ERROR: Insufficient disk space on $server" >> "$LOG_FILE"
+        return 1
     fi
 
     update_status "$server" "Applying updates (via $pkg_manager)..."
@@ -950,7 +1099,7 @@ apply_updates() {
     if [[ "$kernel_updated" == "true" ]]; then
         update_status "$server" "Updates complete - kernel updated - initiating reboot..."
         echo "$(date) - Kernel updated on $server - initiating reboot" >> "$LOG_FILE"
-        echo "kernel_update" > "$TEMP_DIR/${server}.update_type"
+        safe_write_file "$TEMP_DIR/${server}.update_type" "kernel_update"
 
         # Wait 2 seconds before rebooting to ensure everything is flushed
         sleep 2
@@ -969,7 +1118,7 @@ apply_updates() {
         # No kernel update - mark as complete without reboot
         update_status "$server" "✓ Complete - No reboot needed"
         echo "$(date) - Updates completed on $server (no kernel update)" >> "$LOG_FILE"
-        echo "no_reboot" > "$TEMP_DIR/${server}.update_type"
+        safe_write_file "$TEMP_DIR/${server}.update_type" "no_reboot"
     fi
 
     return 0
@@ -979,9 +1128,9 @@ apply_updates() {
 # Display server summary and validate SSH connectivity
 # ============================================================================
 echo ""
-echo -e "${BOLD}${BLUE}╔════════════════════════════════════════════════════════════════════════════════╗${NC}"
-echo -e "${BOLD}${BLUE}║                         SERVER UPDATE DASHBOARD                               ║${NC}"
-echo -e "${BOLD}${BLUE}╚════════════════════════════════════════════════════════════════════════════════╝${NC}"
+echo -e "${BOLD}${BLUE}+==============================================================================+${NC}"
+echo -e "${BOLD}${BLUE}|                       SERVER UPDATE DASHBOARD                                |${NC}"
+echo -e "${BOLD}${BLUE}+==============================================================================+${NC}"
 echo ""
 echo -e "${BOLD}Servers to check (${#SERVERS[@]} total):${NC}"
 for server in "${SERVERS[@]}"; do
@@ -1022,6 +1171,9 @@ while [[ $(jobs -r | wc -l) -gt 0 ]]; do
     sleep "$DASHBOARD_REFRESH"
 done
 
+# Ensure all background jobs are truly finished (Fix: Issue #30)
+wait
+
 # Display final dashboard state
 draw_dashboard
 
@@ -1055,8 +1207,8 @@ for server in "${SERVERS[@]}"; do
         continue
     fi
 
-    # Read status with error handling
-    status=$(cat "$status_file" 2>/dev/null || echo "Unknown")
+    # Read status with flock protection
+    status=$(safe_read_file "$status_file" "Unknown")
 
     # Skip servers with errors or no updates
     if [[ "$status" == *"ERROR"* ]] || [[ "$status" == *"No updates"* ]]; then
@@ -1069,10 +1221,10 @@ for server in "${SERVERS[@]}"; do
     fi
 
     # Display server header
-    echo -e "${BOLD}${BLUE}════════════════════════════════════════════════════════════════════════════════${NC}"
+    echo -e "${BOLD}${BLUE}=====================================================================${NC}"
     display_name=$(get_display_name "$server")
     echo -e "${BOLD}${GREEN}Server: ${CYAN}$display_name${NC}"
-    echo -e "${BOLD}${BLUE}════════════════════════════════════════════════════════════════════════════════${NC}"
+    echo -e "${BOLD}${BLUE}=====================================================================${NC}"
     echo ""
 
     # ========================================
@@ -1080,15 +1232,12 @@ for server in "${SERVERS[@]}"; do
     # Highlight kernel packages in RED BOLD since they require reboot
     # ========================================
     # Read package manager from temp file (set during check_server_updates)
-    pkg_manager="unknown"
-    if [[ -f "$TEMP_DIR/${server}.pkg_manager" ]]; then
-        pkg_manager=$(cat "$TEMP_DIR/${server}.pkg_manager" 2>/dev/null || echo "unknown")
-    fi
+    pkg_manager=$(safe_read_file "$TEMP_DIR/${server}.pkg_manager" "unknown")
 
     case "$pkg_manager" in
         apt)
             # For apt, display the upgradeable packages list
-            grep -v "Listing..." "$output_file" | while read -r line; do
+            grep -v "^Listing\.\.\.$" "$output_file" | while read -r line; do
                 if has_kernel_package "$line" "apt"; then
                     echo -e "${RED}${BOLD}$line${NC}"
                 else
@@ -1189,6 +1338,9 @@ if [[ -f "$TEMP_DIR/approved_servers.txt" ]]; then
         sleep "$DASHBOARD_REFRESH"
     done
 
+    # Ensure all background jobs are truly finished (Fix: Issue #30)
+    wait
+
     # Display final dashboard state
     draw_dashboard
 
@@ -1201,9 +1353,9 @@ if [[ -f "$TEMP_DIR/approved_servers.txt" ]]; then
     #   - Failed updates or reboot verification failures
     # ========================================================================
     echo ""
-    echo -e "${BOLD}${BLUE}════════════════════════════════════════════════════════════════════════════════${NC}"
+    echo -e "${BOLD}${BLUE}=====================================================================${NC}"
     echo -e "${BOLD}${GREEN}Remote Server Update Results:${NC}"
-    echo -e "${BOLD}${BLUE}════════════════════════════════════════════════════════════════════════════════${NC}"
+    echo -e "${BOLD}${BLUE}=====================================================================${NC}"
     echo ""
 
     # Initialize counters for summary statistics
@@ -1224,26 +1376,18 @@ if [[ -f "$TEMP_DIR/approved_servers.txt" ]]; then
         result_color="${GREEN}"
 
         # Determine what type of update was performed (kernel or regular)
-        if [[ -f "$TEMP_DIR/${server}.update_type" ]]; then
-            update_type=$(cat "$TEMP_DIR/${server}.update_type" 2>/dev/null)
-        fi
+        update_type=$(safe_read_file "$TEMP_DIR/${server}.update_type" "")
 
         # For kernel updates, check if reboot was successful
         if [[ "$update_type" == "kernel_update" ]]; then
-            if [[ -f "$TEMP_DIR/${server}.reboot_status" ]]; then
-                reboot_status=$(cat "$TEMP_DIR/${server}.reboot_status" 2>/dev/null)
-                if [[ "$reboot_status" == "success" ]]; then
-                    result_msg="✓ Updated and reboot complete"
-                    result_color="${GREEN}"
-                    ((servers_rebooted++))
-                else
-                    result_msg="✗ Updated but failed to verify reboot"
-                    result_color="${RED}"
-                    ((servers_failed++))
-                fi
+            reboot_status=$(safe_read_file "$TEMP_DIR/${server}.reboot_status" "")
+            if [[ "$reboot_status" == "success" ]]; then
+                result_msg="✓ Updated and reboot complete"
+                result_color="${GREEN}"
+                ((servers_rebooted++))
             else
-                result_msg="✗ Update completed but reboot status unknown"
-                result_color="${YELLOW}"
+                result_msg="✗ Updated but failed to verify reboot"
+                result_color="${RED}"
                 ((servers_failed++))
             fi
         elif [[ "$update_type" == "no_reboot" ]]; then
@@ -1252,7 +1396,7 @@ if [[ -f "$TEMP_DIR/approved_servers.txt" ]]; then
             ((servers_updated++))
         else
             # No update type recorded - check status for error messages
-            current_status=$(cat "$TEMP_DIR/${server}.status" 2>/dev/null || echo "Unknown")
+            current_status=$(safe_read_file "$TEMP_DIR/${server}.status" "Unknown")
             if [[ "$current_status" == *"ERROR"* ]]; then
                 result_msg="✗ Update failed"
                 result_color="${RED}"
@@ -1295,7 +1439,7 @@ for server in "${SERVERS[@]}"; do
     if [[ "$server" == "localhost" ]]; then
         # Check if localhost has updates (check the output file exists and has content)
         if [[ -f "$TEMP_DIR/localhost.output" ]]; then
-            status=$(cat "$TEMP_DIR/localhost.status" 2>/dev/null || echo "")
+            status=$(safe_read_file "$TEMP_DIR/localhost.status" "")
             # Only prompt if localhost has updates (not errors or "No updates")
             if [[ "$status" != *"ERROR"* && "$status" != *"No updates"* ]]; then
                 # Verify updates are actually available (check for package manager output)
@@ -1310,19 +1454,17 @@ done
 
 if [[ "$localhost_has_updates" == "true" ]]; then
     echo ""
-    echo -e "${BOLD}${BLUE}════════════════════════════════════════════════════════════════════════════════${NC}"
+    echo -e "${BOLD}${BLUE}=====================================================================${NC}"
     echo -e "${BOLD}${YELLOW}Local Server Update Pending${NC}"
-    echo -e "${BOLD}${BLUE}════════════════════════════════════════════════════════════════════════════════${NC}"
+    echo -e "${BOLD}${BLUE}=====================================================================${NC}"
     echo ""
     echo -e "${YELLOW}All remote servers have completed their updates.${NC}"
     echo -e "${YELLOW}The local server (localhost) is ready to be updated.${NC}"
     echo ""
 
     # Get package manager for localhost (read from temp file set in Phase 1)
-    pkg_manager="unknown"
-    if [[ -f "$TEMP_DIR/localhost.pkg_manager" ]]; then
-        pkg_manager=$(cat "$TEMP_DIR/localhost.pkg_manager" 2>/dev/null || echo "unknown")
-    else
+    pkg_manager=$(safe_read_file "$TEMP_DIR/localhost.pkg_manager" "")
+    if [[ -z "$pkg_manager" || "$pkg_manager" == "unknown" ]]; then
         # Fallback: detect it now if temp file doesn't exist
         pkg_manager=$(detect_package_manager "localhost")
     fi
@@ -1334,7 +1476,7 @@ if [[ "$localhost_has_updates" == "true" ]]; then
 
         case "$pkg_manager" in
             apt)
-                grep -v "Listing..." "$TEMP_DIR/localhost.output" | head -20
+                grep -v "^Listing\.\.\.$" "$TEMP_DIR/localhost.output" | head -20
                 ;;
             dnf|yum)
                 sed -n '/^Upgrading:/,/^Transaction Summary/p' "$TEMP_DIR/localhost.output" | head -20
@@ -1368,7 +1510,7 @@ if [[ "$localhost_has_updates" == "true" ]]; then
             proceed=false
         fi
     else
-        echo -e "${BOLD}${YELLOW}════════════════════════════════════════════════════════════════════════════════${NC}"
+        echo -e "${BOLD}${YELLOW}=====================================================================${NC}"
         echo -e -n "${BOLD}${YELLOW}Proceed with local server update? [y/N]: ${NC}"
         read -r response
         echo ""
@@ -1442,9 +1584,9 @@ if [[ "$localhost_has_updates" == "true" ]]; then
 
             if [[ "$kernel_updated" == "true" ]]; then
                 echo ""
-                echo -e "${YELLOW}${BOLD}════════════════════════════════════════════════════════════════════════════════${NC}"
+                echo -e "${YELLOW}${BOLD}=====================================================================${NC}"
                 echo -e "${YELLOW}${BOLD}⚠️  KERNEL UPDATE DETECTED - REBOOT REQUIRED${NC}"
-                echo -e "${YELLOW}${BOLD}════════════════════════════════════════════════════════════════════════════════${NC}"
+                echo -e "${YELLOW}${BOLD}=====================================================================${NC}"
                 echo ""
                 echo -e "${YELLOW}The local server kernel has been updated and requires a reboot.${NC}"
                 do_reboot=false
@@ -1492,9 +1634,9 @@ fi
 
 # Final summary
 echo ""
-echo -e "${BOLD}${BLUE}════════════════════════════════════════════════════════════════════════════════${NC}"
+echo -e "${BOLD}${BLUE}=====================================================================${NC}"
 echo -e "${BOLD}${GREEN}All server operations complete!${NC}"
 echo -e "${BOLD}${BLUE}Completed: $(date)${NC}"
 echo -e "${BOLD}${BLUE}Check $LOG_FILE for detailed logs${NC}"
-echo -e "${BOLD}${BLUE}════════════════════════════════════════════════════════════════════════════════${NC}"
+echo -e "${BOLD}${BLUE}=====================================================================${NC}"
 echo ""
