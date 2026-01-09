@@ -311,8 +311,8 @@ The script automatically detects and supports:
 
 ### Pre-Flight Safety Checks
 - ✅ **Disk space checking** prevents catastrophic failures
-  - Requires minimum 10GB free on `/` partition
-  - Requires minimum 500MB free on `/boot` partition
+  - Requires minimum 2GB free on `/` partition (realistic for most updates)
+  - Requires minimum 300MB free on `/boot` partition (enough for kernels)
   - New `check_disk_space()` function runs before every update
   - Prevents half-installed packages and unbootable systems
   - Clear error messages showing available vs required space

@@ -81,8 +81,8 @@ Script downloads and installs packages without checking if there's enough space:
 ### Solution Implemented
 
 #### New check_disk_space() Function (lines 619-665)
-- Checks `/` partition for at least **10GB free**
-- Checks `/boot` partition for at least **500MB free** (if separate partition)
+- Checks `/` partition for at least **2GB free** (realistic for most updates)
+- Checks `/boot` partition for at least **300MB free** (if separate partition)
 - Returns 0 if sufficient, 1 if insufficient
 - Non-fatal if unable to determine space (allows to proceed)
 

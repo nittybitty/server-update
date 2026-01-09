@@ -453,8 +453,8 @@ Log file created with 600 permissions. Warns if log exceeds 10MB.
   - Reduces execution time by 2-5x on typical workloads
   - Prevents hitting SSH MaxStartups limits
 - **Disk space checking**: Pre-flight checks prevent catastrophic failures
-  - Requires 10GB free on `/` partition
-  - Requires 500MB free on `/boot` partition
+  - Requires 2GB free on `/` partition (realistic for most updates)
+  - Requires 300MB free on `/boot` partition (enough for kernel updates)
   - New `check_disk_space()` function runs before every update
   - Prevents half-installed packages and unbootable systems
 - **Enhanced security**: Multiple security improvements

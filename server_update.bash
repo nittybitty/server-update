@@ -644,19 +644,19 @@ check_disk_space() {
         return 0  # Allow to proceed if we can't check (non-fatal)
     fi
 
-    # Require at least 10GB free on /
-    if [[ "$root_avail" -lt 10 ]]; then
+    # Require at least 2GB free on / (realistic for most updates including kernels)
+    if [[ "$root_avail" -lt 2 ]]; then
         echo -e "${RED}[ERROR]${NC} Insufficient disk space on / for $(get_display_name "$server")"
-        echo -e "${RED}[ERROR]${NC} Available: ${root_avail}GB, Required: 10GB"
+        echo -e "${RED}[ERROR]${NC} Available: ${root_avail}GB, Required: 2GB minimum"
         return 1
     fi
 
     # Check /boot if it exists as a separate partition (non-fatal if it doesn't exist)
     if [[ -n "$boot_avail" && "$boot_avail" =~ ^[0-9]+$ ]]; then
-        # Require at least 500MB free on /boot
-        if [[ "$boot_avail" -lt 500 ]]; then
+        # Require at least 300MB free on /boot (enough for most kernel updates)
+        if [[ "$boot_avail" -lt 300 ]]; then
             echo -e "${RED}[ERROR]${NC} Insufficient disk space on /boot for $(get_display_name "$server")"
-            echo -e "${RED}[ERROR]${NC} Available: ${boot_avail}MB, Required: 500MB"
+            echo -e "${RED}[ERROR]${NC} Available: ${boot_avail}MB, Required: 300MB minimum"
             return 1
         fi
     fi
