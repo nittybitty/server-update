@@ -6,7 +6,7 @@ umask 077
 # To update the local server, add a line like "local localhost" to your server_list.txt file.
 
 # Server Update Dashboard
-# Version: 1.3
+# Version: 1.4 (Refactored)
 
 # Color definitions for output
 RED='\033[0;31m'
@@ -22,6 +22,10 @@ NC='\033[0m' # No Color
 SERVER_LIST="server_list.txt"
 LOG_FILE="server_update.log"
 LOCK_FILE="/tmp/server_update.lock"
+
+# Constants for disk space requirements (Issue #10)
+readonly MIN_ROOT_SPACE_GB=2
+readonly MIN_BOOT_SPACE_MB=300
 
 # Default values for configurable variables
 # DNF_TIMEOUT: Maximum time (seconds) to wait for dnf commands to complete (default: 600 = 10 minutes)
@@ -271,9 +275,65 @@ safe_read_file() {
     return 0
 }
 
+# ============================================================================
+# Helper Functions for Output and Caching (Refactoring - Issue #11, #2)
+# ============================================================================
+
+# Color output helper functions
+print_header() {
+    echo -e "${BOLD}${BLUE}$1${NC}"
+}
+
+print_separator() {
+    local width="${1:-69}"
+    local char="${2:-=}"
+    printf "${BLUE}%${width}s${NC}\n" | tr ' ' "$char"
+}
+
+print_error() {
+    echo -e "${RED}${BOLD}[ERROR]${NC} $1"
+}
+
+print_warning() {
+    echo -e "${YELLOW}[WARNING]${NC} $1"
+}
+
+print_success() {
+    echo -e "${GREEN}$1${NC}"
+}
+
+print_info() {
+    echo -e "${CYAN}$1${NC}"
+}
+
+# Caching wrapper for package manager reads (Issue #2)
+get_pkg_manager() {
+    local server="$1"
+    if [[ -z "${PKG_MANAGER_CACHE[$server]}" ]]; then
+        PKG_MANAGER_CACHE[$server]=$(safe_read_file "$TEMP_DIR/${server}.pkg_manager" "unknown")
+    fi
+    echo "${PKG_MANAGER_CACHE[$server]}"
+}
+
+# Caching wrapper for display name (Issue #13)
+get_display_name() {
+    local server="$1"
+    if [[ -z "${DISPLAY_NAME_CACHE[$server]}" ]]; then
+        DISPLAY_NAME_CACHE[$server]="$server (${SERVER_NICKNAMES[$server]})"
+    fi
+    echo "${DISPLAY_NAME_CACHE[$server]}"
+}
+
+# Filter apt output header (Issue #12)
+filter_apt_header() {
+    grep -v "^Listing\.\.\.$" "$@"
+}
+
+# ============================================================================
+
 # Function to display usage information
 show_help() {
-    echo "Server Update Dashboard - Version 1.3"
+    echo "Server Update Dashboard - Version 1.4 (Refactored)"
     echo ""
     echo "Usage: $0 [OPTIONS]"
     echo ""
@@ -297,7 +357,7 @@ show_help() {
 # Function to display version information
 show_version() {
     echo "Server Update Dashboard"
-    echo "Version: 1.3"
+    echo "Version: 1.4 (Refactored)"
     exit 0
 }
 
@@ -410,6 +470,11 @@ fi
 declare -a SERVERS
 declare -A SERVER_NICKNAMES
 declare -A SERVER_PORTS
+
+# Caching arrays for performance (Issue #2)
+declare -A PKG_MANAGER_CACHE
+declare -A DISPLAY_NAME_CACHE
+
 line_number=0
 
 while read -r -a parts; do
@@ -518,28 +583,29 @@ detect_package_manager() {
 # Function to gather system information (OS release and kernel version)
 # Parameters: $1 = server address
 # Side effects: Writes OS and kernel info to temp files
+# Optimization: Batches OS and kernel queries into single SSH call (Issue #4)
 gather_system_info() {
     local server="$1"
     local ssh_cmd
     ssh_cmd=$(get_ssh_cmd "$server")
 
-    # Get OS release info
-    local os_info
-    if [[ -n "$ssh_cmd" ]]; then
-        os_info=$($ssh_cmd "$server" "cat /etc/os-release 2>/dev/null | grep '^PRETTY_NAME=' | cut -d'\"' -f2" 2>/dev/null || echo "Unknown")
-        # Fallback to lsb_release or basic info
-        if [[ "$os_info" == "Unknown" || -z "$os_info" ]]; then
-            os_info=$($ssh_cmd "$server" "lsb_release -d 2>/dev/null | cut -f2" 2>/dev/null || echo "Unknown")
-        fi
-    else
-        os_info=$(grep '^PRETTY_NAME=' /etc/os-release 2>/dev/null | cut -d'"' -f2 || echo "Unknown")
-    fi
+    local os_info kernel_ver
 
-    # Get kernel version
-    local kernel_ver
     if [[ -n "$ssh_cmd" ]]; then
-        kernel_ver=$($ssh_cmd "$server" "uname -r" 2>/dev/null || echo "Unknown")
+        # Batch both queries into single SSH call to reduce network round trips
+        local batch_output
+        batch_output=$($ssh_cmd "$server" "echo 'OS:'; cat /etc/os-release 2>/dev/null | grep '^PRETTY_NAME=' | cut -d'\"' -f2 || lsb_release -d 2>/dev/null | cut -f2 || echo 'Unknown'; echo 'KERNEL:'; uname -r 2>/dev/null || echo 'Unknown'" 2>/dev/null)
+
+        # Parse batched output
+        os_info=$(echo "$batch_output" | sed -n '/^OS:/,/^KERNEL:/{/^OS:/d;/^KERNEL:/d;p}' | head -1)
+        kernel_ver=$(echo "$batch_output" | sed -n '/^KERNEL:/,$p' | tail -1)
+
+        # Handle empty results
+        [[ -z "$os_info" ]] && os_info="Unknown"
+        [[ -z "$kernel_ver" ]] && kernel_ver="Unknown"
     else
+        # Localhost: direct commands
+        os_info=$(grep '^PRETTY_NAME=' /etc/os-release 2>/dev/null | cut -d'"' -f2 || echo "Unknown")
         kernel_ver=$(uname -r 2>/dev/null || echo "Unknown")
     fi
 
@@ -619,6 +685,7 @@ execute_remote_command() {
 # Function to check disk space before updates (Fix: Issue #7)
 # Parameters: $1 = server address
 # Returns: 0 if sufficient space, 1 if insufficient
+# Optimization: Batches both df queries into single SSH call (Issue #4)
 check_disk_space() {
     local server="$1"
     local ssh_cmd
@@ -629,11 +696,16 @@ check_disk_space() {
     local root_avail boot_avail
 
     if [[ -n "$ssh_cmd" ]]; then
+        # Batch both df queries into single SSH call to reduce network round trips
         # shellcheck disable=SC2086
-        root_avail=$($ssh_cmd "$server" "df -BG / | tail -1 | awk '{print \$4}' | sed 's/G//'" 2>/dev/null)
-        # shellcheck disable=SC2086
-        boot_avail=$($ssh_cmd "$server" "df -BM /boot 2>/dev/null | tail -1 | awk '{print \$4}' | sed 's/M//'" 2>/dev/null)
+        local batch_output
+        batch_output=$($ssh_cmd "$server" "echo 'ROOT:'; df -BG / 2>/dev/null | tail -1 | awk '{print \$4}' | sed 's/G//'; echo 'BOOT:'; df -BM /boot 2>/dev/null | tail -1 | awk '{print \$4}' | sed 's/M//'" 2>/dev/null)
+
+        # Parse batched output
+        root_avail=$(echo "$batch_output" | sed -n '/^ROOT:/,/^BOOT:/{/^ROOT:/d;/^BOOT:/d;p}' | head -1)
+        boot_avail=$(echo "$batch_output" | sed -n '/^BOOT:/,$p' | tail -1)
     else
+        # Localhost: direct commands
         root_avail=$(df -BG / | tail -1 | awk '{print $4}' | sed 's/G//')
         boot_avail=$(df -BM /boot 2>/dev/null | tail -1 | awk '{print $4}' | sed 's/M//' 2>/dev/null)
     fi
@@ -644,32 +716,24 @@ check_disk_space() {
         return 0  # Allow to proceed if we can't check (non-fatal)
     fi
 
-    # Require at least 2GB free on / (realistic for most updates including kernels)
-    if [[ "$root_avail" -lt 2 ]]; then
-        echo -e "${RED}[ERROR]${NC} Insufficient disk space on / for $(get_display_name "$server")"
-        echo -e "${RED}[ERROR]${NC} Available: ${root_avail}GB, Required: 2GB minimum"
+    # Require minimum free space on / (using constant)
+    if [[ "$root_avail" -lt "$MIN_ROOT_SPACE_GB" ]]; then
+        print_error "Insufficient disk space on / for $(get_display_name "$server")"
+        print_error "Available: ${root_avail}GB, Required: ${MIN_ROOT_SPACE_GB}GB minimum"
         return 1
     fi
 
     # Check /boot if it exists as a separate partition (non-fatal if it doesn't exist)
     if [[ -n "$boot_avail" && "$boot_avail" =~ ^[0-9]+$ ]]; then
-        # Require at least 300MB free on /boot (enough for most kernel updates)
-        if [[ "$boot_avail" -lt 300 ]]; then
-            echo -e "${RED}[ERROR]${NC} Insufficient disk space on /boot for $(get_display_name "$server")"
-            echo -e "${RED}[ERROR]${NC} Available: ${boot_avail}MB, Required: 300MB minimum"
+        # Require minimum free space on /boot (using constant)
+        if [[ "$boot_avail" -lt "$MIN_BOOT_SPACE_MB" ]]; then
+            print_error "Insufficient disk space on /boot for $(get_display_name "$server")"
+            print_error "Available: ${boot_avail}MB, Required: ${MIN_BOOT_SPACE_MB}MB minimum"
             return 1
         fi
     fi
 
     return 0
-}
-
-# Function to format server display name
-# Parameters: $1 = server address
-# Returns: Formatted string "server (nickname)"
-get_display_name() {
-    local server="$1"
-    echo "$server (${SERVER_NICKNAMES[$server]})"
 }
 
 # Function to check if output contains kernel package references
@@ -892,7 +956,7 @@ check_server_updates() {
     case "$pkg_manager" in
         apt)
             # Count upgradeable packages (excluding the "Listing..." header) (Fix: Issue #29)
-            total_count=$(echo "$pkg_output" | grep -v "^Listing\.\.\.$" | grep -c "/" || echo 0)
+            total_count=$(echo "$pkg_output" | filter_apt_header | grep -c "/" || echo 0)
             if [[ $total_count -gt 0 ]]; then
                 update_status "$server" "${total_count} updates available"
                 return 0
@@ -1018,9 +1082,9 @@ apply_updates() {
     local server="$1"
     local ssh_cmd
     ssh_cmd=$(get_ssh_cmd "$server")
-    # Read package manager from temp file (set during check_server_updates)
+    # Read package manager from cache (set during check_server_updates)
     local pkg_manager
-    pkg_manager=$(safe_read_file "$TEMP_DIR/${server}.pkg_manager" "unknown")
+    pkg_manager=$(get_pkg_manager "$server")
 
     # Check disk space before applying updates (Fix: Issue #7)
     update_status "$server" "Checking disk space..."
@@ -1231,13 +1295,13 @@ for server in "${SERVERS[@]}"; do
     # Extract and display package lists from package manager output
     # Highlight kernel packages in RED BOLD since they require reboot
     # ========================================
-    # Read package manager from temp file (set during check_server_updates)
-    pkg_manager=$(safe_read_file "$TEMP_DIR/${server}.pkg_manager" "unknown")
+    # Read package manager from cache (set during check_server_updates)
+    pkg_manager=$(get_pkg_manager "$server")
 
     case "$pkg_manager" in
         apt)
             # For apt, display the upgradeable packages list
-            grep -v "^Listing\.\.\.$" "$output_file" | while read -r line; do
+            filter_apt_header "$output_file" | while read -r line; do
                 if has_kernel_package "$line" "apt"; then
                     echo -e "${RED}${BOLD}$line${NC}"
                 else
@@ -1462,10 +1526,10 @@ if [[ "$localhost_has_updates" == "true" ]]; then
     echo -e "${YELLOW}The local server (localhost) is ready to be updated.${NC}"
     echo ""
 
-    # Get package manager for localhost (read from temp file set in Phase 1)
-    pkg_manager=$(safe_read_file "$TEMP_DIR/localhost.pkg_manager" "")
+    # Get package manager for localhost (read from cache set in Phase 1)
+    pkg_manager=$(get_pkg_manager "localhost")
     if [[ -z "$pkg_manager" || "$pkg_manager" == "unknown" ]]; then
-        # Fallback: detect it now if temp file doesn't exist
+        # Fallback: detect it now if cache doesn't exist
         pkg_manager=$(detect_package_manager "localhost")
     fi
 
@@ -1476,7 +1540,7 @@ if [[ "$localhost_has_updates" == "true" ]]; then
 
         case "$pkg_manager" in
             apt)
-                grep -v "^Listing\.\.\.$" "$TEMP_DIR/localhost.output" | head -20
+                filter_apt_header "$TEMP_DIR/localhost.output" | head -20
                 ;;
             dnf|yum)
                 sed -n '/^Upgrading:/,/^Transaction Summary/p' "$TEMP_DIR/localhost.output" | head -20
