@@ -543,11 +543,14 @@ detect_package_manager() {
 
     # Check for package managers in order of preference: apt, dnf, yum
     if [[ -n "$ssh_cmd" ]]; then
-        if $ssh_cmd "$server" "command -v apt-get" &>/dev/null; then
+        # shellcheck disable=SC2086
+        if $ssh_cmd "$server" "command -v apt-get >/dev/null 2>&1 && echo apt" 2>/dev/null | grep -q "apt"; then
             echo "apt"
-        elif $ssh_cmd "$server" "command -v dnf" &>/dev/null; then
+        # shellcheck disable=SC2086
+        elif $ssh_cmd "$server" "command -v dnf >/dev/null 2>&1 && echo dnf" 2>/dev/null | grep -q "dnf"; then
             echo "dnf"
-        elif $ssh_cmd "$server" "command -v yum" &>/dev/null; then
+        # shellcheck disable=SC2086
+        elif $ssh_cmd "$server" "command -v yum >/dev/null 2>&1 && echo yum" 2>/dev/null | grep -q "yum"; then
             echo "yum"
         else
             echo "unknown"
@@ -569,7 +572,7 @@ detect_package_manager() {
 # Function to gather system information (OS release and kernel version)
 # Parameters: $1 = server address
 # Side effects: Writes OS and kernel info to temp files
-# Optimization: Batches OS and kernel queries into single SSH call (Issue #4)
+# Simplified for compatibility with old SSH versions
 gather_system_info() {
     local server="$1"
     local ssh_cmd
@@ -578,17 +581,12 @@ gather_system_info() {
     local os_info kernel_ver
 
     if [[ -n "$ssh_cmd" ]]; then
-        # Batch both queries into single SSH call to reduce network round trips
-        local batch_output
-        batch_output=$($ssh_cmd "$server" "echo 'OS:'; cat /etc/os-release 2>/dev/null | grep '^PRETTY_NAME=' | cut -d'\"' -f2 || lsb_release -d 2>/dev/null | cut -f2 || echo 'Unknown'; echo 'KERNEL:'; uname -r 2>/dev/null || echo 'Unknown'" 2>/dev/null)
-
-        # Parse batched output
-        os_info=$(echo "$batch_output" | sed -n '/^OS:/,/^KERNEL:/{/^OS:/d;/^KERNEL:/d;p}' | head -1)
-        kernel_ver=$(echo "$batch_output" | sed -n '/^KERNEL:/,$p' | tail -1)
-
-        # Handle empty results
-        [[ -z "$os_info" ]] && os_info="Unknown"
-        [[ -z "$kernel_ver" ]] && kernel_ver="Unknown"
+        # Use separate simple SSH calls for compatibility with OpenSSH 5.3
+        os_info=$($ssh_cmd "$server" "grep '^PRETTY_NAME=' /etc/os-release 2>/dev/null | cut -d'\"' -f2" 2>/dev/null || echo "Unknown")
+        if [[ "$os_info" == "Unknown" || -z "$os_info" ]]; then
+            os_info=$($ssh_cmd "$server" "lsb_release -d 2>/dev/null | cut -f2" 2>/dev/null || echo "Unknown")
+        fi
+        kernel_ver=$($ssh_cmd "$server" "uname -r" 2>/dev/null || echo "Unknown")
     else
         # Localhost: direct commands
         os_info=$(grep '^PRETTY_NAME=' /etc/os-release 2>/dev/null | cut -d'"' -f2 || echo "Unknown")
@@ -675,14 +673,11 @@ check_disk_space() {
     local root_avail boot_avail
 
     if [[ -n "$ssh_cmd" ]]; then
-        # Batch both df queries into single SSH call to reduce network round trips
+        # Use separate simple SSH calls for compatibility with OpenSSH 5.3
         # shellcheck disable=SC2086
-        local batch_output
-        batch_output=$($ssh_cmd "$server" "echo 'ROOT:'; df -BG / 2>/dev/null | tail -1 | awk '{print \$4}' | sed 's/G//'; echo 'BOOT:'; df -BM /boot 2>/dev/null | tail -1 | awk '{print \$4}' | sed 's/M//'" 2>/dev/null)
-
-        # Parse batched output
-        root_avail=$(echo "$batch_output" | sed -n '/^ROOT:/,/^BOOT:/{/^ROOT:/d;/^BOOT:/d;p}' | head -1)
-        boot_avail=$(echo "$batch_output" | sed -n '/^BOOT:/,$p' | tail -1)
+        root_avail=$($ssh_cmd "$server" "df -BG / | tail -1 | awk '{print \$4}' | sed 's/G//'" 2>/dev/null)
+        # shellcheck disable=SC2086
+        boot_avail=$($ssh_cmd "$server" "df -BM /boot 2>/dev/null | tail -1 | awk '{print \$4}' | sed 's/M//'" 2>/dev/null)
     else
         # Localhost: direct commands
         root_avail=$(df -BG / | tail -1 | awk '{print $4}' | sed 's/G//')
