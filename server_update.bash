@@ -153,11 +153,6 @@ if [[ ! -d "$TEMP_DIR" ]]; then
 fi
 chmod 700 "$TEMP_DIR"
 
-# Create SSH control socket directory (Fix: Issue #3 - SSH connection pooling)
-SSH_CONTROL_DIR="$TEMP_DIR/ssh_control"
-mkdir -p "$SSH_CONTROL_DIR"
-chmod 700 "$SSH_CONTROL_DIR"
-
 # Function to validate server name/IP to prevent command injection
 # Parameters: $1 = server name or IP address
 # Returns: 0 if valid, 1 if invalid
@@ -406,15 +401,6 @@ done
 
 # Cleanup function to run on exit
 cleanup() {
-    # Close all SSH control connections (Fix: Issue #3)
-    if [[ -d "$SSH_CONTROL_DIR" ]]; then
-        for socket in "$SSH_CONTROL_DIR"/*; do
-            if [[ -S "$socket" ]]; then
-                ssh -O exit -o ControlPath="$socket" 2>/dev/null || true
-            fi
-        done
-    fi
-
     # Kill all background jobs spawned by this script
     # This prevents orphaned dnf/yum processes that can hang future runs
     local jobs_list
@@ -627,13 +613,9 @@ get_ssh_cmd() {
         return
     fi
 
-    # Build SSH command with connection pooling and better security (Fix: Issues #3, #41)
-    # ControlMaster=auto: Reuse existing connections when available
-    # ControlPersist=600: Keep connection alive for 10 minutes after last use
-    # ControlPath: Socket file for connection sharing
-    # StrictHostKeyChecking=accept-new: Accept new hosts but verify known hosts (more secure than 'no')
-    local control_socket="$SSH_CONTROL_DIR/${server}_%h_%p_%r"
-    local ssh_cmd="ssh -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 -o ControlMaster=auto -o ControlPersist=600 -o ControlPath=\"$control_socket\""
+    # Build SSH command with basic options that work on all SSH versions
+    # Use simple options for maximum compatibility with old SSH (CentOS 6.5, etc.)
+    local ssh_cmd="ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10"
 
     if [[ -n "${SERVER_PORTS[$server]}" ]]; then
         # Append port with proper quoting
