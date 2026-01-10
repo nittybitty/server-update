@@ -104,8 +104,8 @@ load_config() {
                     fi
                 fi
 
-                # Assign the validated value
-                declare -g "$key=$value"
+                # Assign the validated value (compatible with Bash 3.x+)
+                eval "$key=\"$value\""
                 break
             fi
         done
