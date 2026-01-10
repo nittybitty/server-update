@@ -8,6 +8,24 @@ server_list.txt
 fuzz_test.bash
 fuzz_results.txt
 fuzz_test_tmp/
+test_*.bash
+*_test.bash
 
 # Python virtual environment
 venv/
+
+# Backup files
+*.backup
+*.bak
+*~
+
+# Temporary files
+*.tmp
+*.temp
+output*.txt
+
+# Analysis and documentation drafts
+REFACTORING_*.md
+FIXES_APPLIED*.md
+HOTFIX_*.md
+changes.txt
