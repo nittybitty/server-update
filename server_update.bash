@@ -613,16 +613,13 @@ get_ssh_cmd() {
         return
     fi
 
-    # Build SSH command with basic options that work on all SSH versions
-    # Use simple options for maximum compatibility with old SSH (CentOS 6.5, etc.)
-    local ssh_cmd="ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10"
-
+    # Build SSH command - must work with OpenSSH 5.3 (CentOS 6.5)
+    # Use separate -o flags (some old SSH versions don't like combined format)
     if [[ -n "${SERVER_PORTS[$server]}" ]]; then
-        # Append port with proper quoting
-        ssh_cmd="$ssh_cmd -p ${SERVER_PORTS[$server]}"
+        echo "ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 -p ${SERVER_PORTS[$server]}"
+    else
+        echo "ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10"
     fi
-
-    echo "$ssh_cmd"
 }
 
 # Function to test if sudo works without password on localhost
