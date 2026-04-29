@@ -241,9 +241,7 @@ safe_write_file() {
     {
         flock -x 200 || return 1
         echo "$content" > "$file_path"
-    } 200>"${file_path}.lock" 2>/dev/null
-
-    return $?
+    } 200>"${file_path}.lock" 2>/dev/null || return 1
 }
 
 # Function to safely read from a file with flock protection
@@ -611,12 +609,12 @@ get_ssh_cmd() {
         return
     fi
 
-    # Build SSH command - must work with OpenSSH 5.3 (CentOS 6.5)
-    # Use separate -o flags (some old SSH versions don't like combined format)
+    # Use separate -o flags (some old SSH versions don't like combined format).
+    # Note: StrictHostKeyChecking=accept-new requires OpenSSH 7.6+ (Oct 2017).
     if [[ -n "${SERVER_PORTS[$server]}" ]]; then
-        echo "ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 -p ${SERVER_PORTS[$server]}"
+        echo "ssh -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 -p ${SERVER_PORTS[$server]}"
     else
-        echo "ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10"
+        echo "ssh -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10"
     fi
 }
 
@@ -641,6 +639,10 @@ execute_remote_command() {
     local timeout="${3:-$DNF_TIMEOUT}"
     local ssh_cmd
     ssh_cmd=$(get_ssh_cmd "$server")
+
+    # Force C locale so package manager output stays English-parseable
+    # (we grep for "Nothing to do", "Transaction Summary", etc).
+    command="export LC_ALL=C; $command"
 
     if [[ -n "$ssh_cmd" ]]; then
         # shellcheck disable=SC2086
@@ -1588,8 +1590,9 @@ if [[ "$localhost_has_updates" == "true" ]]; then
         # Create temp file for output capture (for kernel detection)
         update_output_file="$TEMP_DIR/localhost_update_output.txt"
 
-        # Run update, showing output in real-time and also capturing to file
-        timeout "${DNF_TIMEOUT}s" bash -c "$update_cmd" 2>&1 | tee "$update_output_file"
+        # Run update, showing output in real-time and also capturing to file.
+        # LC_ALL=C keeps output English-parseable (matches execute_remote_command).
+        timeout "${DNF_TIMEOUT}s" bash -c "export LC_ALL=C; $update_cmd" 2>&1 | tee "$update_output_file"
         update_exit_code=${PIPESTATUS[0]}
 
         if [[ $update_exit_code -eq 124 ]]; then
