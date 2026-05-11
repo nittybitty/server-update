@@ -10,6 +10,7 @@ fuzz_results.txt
 fuzz_test_tmp/
 test_*.bash
 *_test.bash
+test/
 
 # Python virtual environment
 venv/
