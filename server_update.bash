@@ -542,13 +542,13 @@ detect_package_manager() {
     # Check for package managers in order of preference: apt, dnf, yum
     if [[ -n "$ssh_cmd" ]]; then
         # shellcheck disable=SC2086
-        if $ssh_cmd "$server" "command -v apt-get >/dev/null 2>&1 && echo apt" 2>/dev/null | grep -q "apt"; then
+        if $ssh_cmd "$server" "command -v apt-get" &>/dev/null; then
             echo "apt"
         # shellcheck disable=SC2086
-        elif $ssh_cmd "$server" "command -v dnf >/dev/null 2>&1 && echo dnf" 2>/dev/null | grep -q "dnf"; then
+        elif $ssh_cmd "$server" "command -v dnf" &>/dev/null; then
             echo "dnf"
         # shellcheck disable=SC2086
-        elif $ssh_cmd "$server" "command -v yum >/dev/null 2>&1 && echo yum" 2>/dev/null | grep -q "yum"; then
+        elif $ssh_cmd "$server" "command -v yum" &>/dev/null; then
             echo "yum"
         else
             echo "unknown"
@@ -611,10 +611,11 @@ get_ssh_cmd() {
 
     # Use separate -o flags (some old SSH versions don't like combined format).
     # Note: StrictHostKeyChecking=accept-new requires OpenSSH 7.6+ (Oct 2017).
+    local base_ssh="ssh -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10"
     if [[ -n "${SERVER_PORTS[$server]}" ]]; then
-        echo "ssh -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 -p ${SERVER_PORTS[$server]}"
+        echo "$base_ssh -p ${SERVER_PORTS[$server]}"
     else
-        echo "ssh -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10"
+        echo "$base_ssh"
     fi
 }
 
@@ -642,11 +643,11 @@ execute_remote_command() {
 
     # Force C locale so package manager output stays English-parseable
     # (we grep for "Nothing to do", "Transaction Summary", etc).
-    command="export LC_ALL=C; $command"
+    local lc_command="export LC_ALL=C; $command"
 
     if [[ -n "$ssh_cmd" ]]; then
         # shellcheck disable=SC2086
-        timeout "${timeout}s" $ssh_cmd "$server" "$command" 2>&1
+        timeout "${timeout}s" $ssh_cmd "$server" "$lc_command" 2>&1
     else
         # For localhost, test if sudo works first (only if command contains sudo)
         if [[ "$command" == *"sudo"* ]]; then
@@ -655,7 +656,7 @@ execute_remote_command() {
                 return 1
             fi
         fi
-        timeout "${timeout}s" bash -c "$command" 2>&1
+        timeout "${timeout}s" bash -c "$lc_command" 2>&1
     fi
 
     return $?
@@ -664,7 +665,6 @@ execute_remote_command() {
 # Function to check disk space before updates (Fix: Issue #7)
 # Parameters: $1 = server address
 # Returns: 0 if sufficient space, 1 if insufficient
-# Optimization: Batches both df queries into single SSH call (Issue #4)
 check_disk_space() {
     local server="$1"
     local ssh_cmd
@@ -677,7 +677,7 @@ check_disk_space() {
     if [[ -n "$ssh_cmd" ]]; then
         # Use separate simple SSH calls for compatibility with OpenSSH 5.3
         # shellcheck disable=SC2086
-        root_avail=$($ssh_cmd "$server" "df -BG / | tail -1 | awk '{print \$4}' | sed 's/G//'" 2>/dev/null)
+        root_avail=$($ssh_cmd "$server" "df -BG / 2>/dev/null | tail -1 | awk '{print \$4}' | sed 's/G//'" 2>/dev/null)
         # shellcheck disable=SC2086
         boot_avail=$($ssh_cmd "$server" "df -BM /boot 2>/dev/null | tail -1 | awk '{print \$4}' | sed 's/M//'" 2>/dev/null)
     else
