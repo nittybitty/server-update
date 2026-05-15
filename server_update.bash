@@ -153,6 +153,14 @@ if [[ ! -d "$TEMP_DIR" ]]; then
 fi
 chmod 700 "$TEMP_DIR"
 
+# SSH connection multiplexing socket directory. Lives inside TEMP_DIR so it's
+# wiped by the same cleanup path. %C in ControlPath hashes user@host:port into
+# a fixed-length token, keeping socket paths well under sun_path's 108-byte cap
+# no matter how long the hostnames get.
+SSH_CONTROL_DIR="$TEMP_DIR/ssh-cm"
+mkdir "$SSH_CONTROL_DIR"
+chmod 700 "$SSH_CONTROL_DIR"
+
 # Function to validate server name/IP to prevent command injection
 # Parameters: $1 = server name or IP address
 # Returns: 0 if valid, 1 if invalid
@@ -411,6 +419,16 @@ cleanup() {
         echo "$jobs_list" | xargs -r kill -KILL 2>/dev/null || true
     fi
 
+    # Close any open SSH ControlMaster sessions so master processes exit
+    # promptly instead of lingering until ControlPersist expires.
+    if [[ -n "${SSH_CONTROL_DIR:-}" && -d "$SSH_CONTROL_DIR" ]]; then
+        local sock
+        for sock in "$SSH_CONTROL_DIR"/cm-*; do
+            [[ -S "$sock" ]] || continue
+            ssh -S "$sock" -O exit _ 2>/dev/null || true
+        done
+    fi
+
     # Remove temporary directory
     rm -rf "$TEMP_DIR"
 
@@ -539,38 +557,27 @@ detect_package_manager() {
     local ssh_cmd
     ssh_cmd=$(get_ssh_cmd "$server")
 
-    # Check for package managers in order of preference: apt, dnf, yum
+    # Probe in a single shell invocation so remote detection costs one SSH
+    # round-trip instead of up to three. Order matters: apt first (Debian/Ubuntu),
+    # then dnf (RHEL 8+/Fedora), then yum (RHEL 7).
+    local probe='if command -v apt-get >/dev/null 2>&1; then echo apt
+elif command -v dnf >/dev/null 2>&1; then echo dnf
+elif command -v yum >/dev/null 2>&1; then echo yum
+else echo unknown
+fi'
+    local result
     if [[ -n "$ssh_cmd" ]]; then
         # shellcheck disable=SC2086
-        if $ssh_cmd "$server" "command -v apt-get" &>/dev/null; then
-            echo "apt"
-        # shellcheck disable=SC2086
-        elif $ssh_cmd "$server" "command -v dnf" &>/dev/null; then
-            echo "dnf"
-        # shellcheck disable=SC2086
-        elif $ssh_cmd "$server" "command -v yum" &>/dev/null; then
-            echo "yum"
-        else
-            echo "unknown"
-        fi
+        result=$($ssh_cmd "$server" "$probe" 2>/dev/null)
     else
-        # Localhost
-        if command -v apt-get &>/dev/null; then
-            echo "apt"
-        elif command -v dnf &>/dev/null; then
-            echo "dnf"
-        elif command -v yum &>/dev/null; then
-            echo "yum"
-        else
-            echo "unknown"
-        fi
+        result=$(bash -c "$probe" 2>/dev/null)
     fi
+    echo "${result:-unknown}"
 }
 
 # Function to gather system information (OS release and kernel version)
 # Parameters: $1 = server address
 # Side effects: Writes OS and kernel info to temp files
-# Simplified for compatibility with old SSH versions
 gather_system_info() {
     local server="$1"
     local ssh_cmd
@@ -579,7 +586,6 @@ gather_system_info() {
     local os_info kernel_ver
 
     if [[ -n "$ssh_cmd" ]]; then
-        # Use separate simple SSH calls for compatibility with OpenSSH 5.3
         os_info=$($ssh_cmd "$server" "grep '^PRETTY_NAME=' /etc/os-release 2>/dev/null | cut -d'\"' -f2" 2>/dev/null || echo "Unknown")
         if [[ "$os_info" == "Unknown" || -z "$os_info" ]]; then
             os_info=$($ssh_cmd "$server" "lsb_release -d 2>/dev/null | cut -f2" 2>/dev/null || echo "Unknown")
@@ -609,9 +615,14 @@ get_ssh_cmd() {
         return
     fi
 
-    # Use separate -o flags (some old SSH versions don't like combined format).
-    # Note: StrictHostKeyChecking=accept-new requires OpenSSH 7.6+ (Oct 2017).
-    local base_ssh="ssh -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10"
+    # ControlMaster=auto reuses one TCP/SSH session per (user,host,port) for the
+    # script's lifetime, cutting per-call handshakes from O(commands) to ~1.
+    # Multiplexing is purely client-side, so target servers don't need anything
+    # beyond standard SSH-2; if the master can't open for any reason, auto-mode
+    # silently degrades to a direct connection.
+    # Note: StrictHostKeyChecking=accept-new and ControlPath %C both require
+    # OpenSSH 6.7+ on the *local* client (the script's host).
+    local base_ssh="ssh -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 -o ControlMaster=auto -o ControlPath=$SSH_CONTROL_DIR/cm-%C -o ControlPersist=600"
     if [[ -n "${SERVER_PORTS[$server]}" ]]; then
         echo "$base_ssh -p ${SERVER_PORTS[$server]}"
     else
@@ -675,7 +686,7 @@ check_disk_space() {
     local root_avail boot_avail
 
     if [[ -n "$ssh_cmd" ]]; then
-        # Use separate simple SSH calls for compatibility with OpenSSH 5.3
+        # Separate calls so a missing /boot partition doesn't poison the / result
         # shellcheck disable=SC2086
         root_avail=$($ssh_cmd "$server" "df -BG / 2>/dev/null | tail -1 | awk '{print \$4}' | sed 's/G//'" 2>/dev/null)
         # shellcheck disable=SC2086
