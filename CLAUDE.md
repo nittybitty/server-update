@@ -12,7 +12,7 @@ This is a bash-based server update management tool for managing package updates 
 - Applies updates in parallel with automatic reboot handling
 - Monitors reboot progress and verifies server availability
 
-**Current Version:** 1.3
+**Current Version:** 1.4
 
 ## Supported Distributions
 
@@ -77,8 +77,10 @@ The script operates in distinct phases:
 - For each server:
   - Tests SSH connectivity
   - Detects package manager: `detect_package_manager()` (lines 357-388)
-  - Gathers system info: `gather_system_info()` (lines 390-419)
-    - OS release from `/etc/os-release`
+  - Gathers system info: `gather_system_info()`
+    - OS release via fallback chain: `/etc/os-release` PRETTY_NAME →
+      `lsb_release -d` → `/etc/redhat-release` (so pre-systemd hosts like
+      CentOS/RHEL 6 still populate the OS column instead of showing `--`)
     - Kernel version from `uname -r`
   - Runs appropriate update check command based on package manager
   - Counts available updates
@@ -344,39 +346,44 @@ Validation performed during parsing (lines 276-352):
 - Prevents package manager conflicts and state corruption
 - Lock cleanup on exit (via trap on EXIT, INT, TERM)
 
-### File Locking (lines 219-262)
-- **flock-based locking** prevents race conditions with temp files
-- Atomic reads and writes for all shared state
-- Protects against file corruption from concurrent access
-- Shared locks for reads (multiple concurrent readers allowed)
-- Exclusive locks for writes (one writer at a time)
+### Atomic Temp File Writes
+- **Atomic-rename writes** prevent torn reads of shared state
+- Writers stage content in a unique `${file}.$BASHPID.tmp` file, then `mv` it
+  into place; `rename(2)` is atomic on a single filesystem
+- A concurrent reader always sees the previous file or the fully-written new
+  one — never an empty or half-written file
+- Reads are plain `cat` (no lock needed), which removes the per-read `flock`
+  fork that the old implementation paid on every dashboard refresh
+- Semantics are whole-file, last-writer-wins — which is exactly what the
+  per-server state model needs (only one writer ever targets a given file)
 - All temp file operations use `safe_write_file()` and `safe_read_file()`
 
 ## Helper Functions
 
-### File Locking Utilities
+### Atomic Temp File Utilities
 
-**Purpose:** Prevent race conditions when multiple background processes read/write temp files simultaneously.
+**Purpose:** Prevent torn reads when background processes write per-server state files that the dashboard reads concurrently.
 
-- `safe_write_file(file_path, content)` (lines 219-232): Atomic write with exclusive lock
-  - Uses `flock -x` for exclusive lock before writing
-  - Creates `.lock` file for synchronization
-  - Returns 0 on success, 1 on failure
+- `safe_write_file(file_path, content)`: Atomic write via staging file + rename
+  - Writes to `${file_path}.$BASHPID.tmp`, then `mv -f` into place
+  - `$BASHPID` (not `$$`) is the real PID of the writing process — background
+    jobs run in subshells where `$$` still holds the parent's PID, so `$BASHPID`
+    is what keeps the staging name unique per writer
+  - Cleans up the staging file and returns 1 on any failure
   - **Usage:** All temp file writes use this function
 
-- `safe_read_file(file_path, default_value)` (lines 234-262): Atomic read with shared lock
-  - Uses `flock -s` for shared lock before reading
-  - Returns default value if file doesn't exist
-  - Prevents reading while another process is writing
-  - Multiple concurrent reads allowed (shared lock)
+- `safe_read_file(file_path, default_value)`: Plain read, no lock
+  - Atomic-rename writes guarantee a reader never observes a partial file
+  - Returns the default value if the file is missing (or vanishes mid-read)
   - **Usage:** All temp file reads use this function
 
 **Implementation Details:**
-- File descriptor 200 used for flock operations
-- Lock files: `${original_file}.lock`
-- Shared locks allow multiple simultaneous readers
-- Exclusive locks ensure atomic writes
-- Minimal overhead - kernel-level locking
+- Atomicity relies on `rename(2)` being atomic on a single filesystem; staging
+  file and target both live inside `$TEMP_DIR`, so the move is a rename
+- Staging files: `${original_file}.$BASHPID.tmp` (removed by the `mv`)
+- Requires bash 4.0+ for `$BASHPID` — already mandated by the script's use of
+  associative arrays (`declare -A`)
+- Cheaper than the previous flock approach: no lock file, no fork per read
 
 **Files Protected:**
 - `${server}.status` - Server status messages
@@ -404,12 +411,34 @@ Validation performed during parsing (lines 276-352):
 
 ## SSH Configuration
 
-The script uses: `ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 [-p PORT]`
+SSH options are **version-aware**, chosen once at startup by
+`detect_ssh_capabilities()` based on the **local** client's OpenSSH version
+(`ssh -V`). All of these are client-side options, so they gate on the controller
+host, not the targets — remote servers only need to speak SSH-2 (every OpenSSH
+since 2.x), which is why even an ancient target like CentOS 6 is fine to manage.
+
+`detect_ssh_capabilities()` sets two globals consumed by `get_ssh_cmd()`:
+
+| Capability | Option | OpenSSH floor | Fallback below floor |
+|------------|--------|---------------|----------------------|
+| Host key policy | `StrictHostKeyChecking=accept-new` | 7.6 | `StrictHostKeyChecking=no` |
+| Connection multiplexing | `ControlMaster=auto` + `ControlPath=$TEMP_DIR/ssh-cm/cm-%C` + `ControlPersist=600` | 6.7 (`%C` token) | multiplexing disabled (one handshake per command) |
+
+`ConnectTimeout=10` is always present. The resulting command for a modern
+controller is:
+`ssh -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 -o ControlMaster=auto -o ControlPath=$TEMP_DIR/ssh-cm/cm-%C -o ControlPersist=600 [-p PORT]`
+
+Effective controller matrix:
+- **RHEL/Rocky/Alma 8+, Debian 10+, Ubuntu 18.04+** (≥7.6): accept-new + pooling
+- **CentOS 7, Debian 9** (7.4): host key falls back to `no`, pooling on
+- **CentOS 6** (5.3): host key `no`, pooling disabled — works, just no speedup
+- Unparseable `ssh -V`: lowest-common-denominator (`no`, no pooling)
 
 **Requirements:**
 - SSH key-based authentication configured for all servers
 - Passwordless sudo recommended for automation
 - SSH service must start on boot (for reboot monitoring)
+- Bash 4.0+ on the controller (already required by associative arrays)
 
 ## Modifying Behavior
 
@@ -446,7 +475,26 @@ Log file created with 600 permissions. Warns if log exceeds 10MB.
 
 ## Version History
 
-### Version 1.3 (Current - 2026-01-07)
+### Version 1.4 (Current - 2026-06-03)
+- **Version-aware SSH options**: `detect_ssh_capabilities()` probes the local
+  `ssh -V` once at startup and builds only the options the client supports
+  - Restores compatibility with old controllers (CentOS 6's OpenSSH 5.3,
+    CentOS 7's 7.4) that choke on `StrictHostKeyChecking=accept-new` (needs 7.6)
+    and `ControlPath %C` (needs 6.7)
+  - Modern controllers keep accept-new + connection pooling; older ones fall
+    back to `StrictHostKeyChecking=no` and/or disabled multiplexing
+  - See the SSH Configuration section for the full controller matrix
+- **Atomic-rename temp writes**: `safe_write_file()`/`safe_read_file()` replaced
+  flock with staging-file + `mv` (atomic `rename(2)`)
+  - Removes a per-read `flock` fork on every dashboard refresh (CPU win on long
+    runs); reads are now plain `cat`
+  - Uses `$BASHPID` so each background writer's staging file is unique
+- **OS detection fallback chain**: `gather_system_info()` now tries
+  `/etc/os-release` → `lsb_release -d` → `/etc/redhat-release`, so pre-systemd
+  hosts (CentOS/RHEL 6) populate the OS column instead of showing `--`
+- **Compatibility**: CentOS 6 supported as both controller and target again
+
+### Version 1.3 (2026-01-07)
 - **SSH connection pooling**: Massive performance improvement with ControlMaster
   - Reuses SSH connections across multiple commands (87% reduction in SSH handshakes)
   - ControlPersist=600: Connections stay alive for 10 minutes

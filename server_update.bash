@@ -232,48 +232,45 @@ validate_ip() {
 }
 
 # ============================================================================
-# FILE LOCKING UTILITIES - Prevent race conditions with temp file access
+# ATOMIC TEMP FILE UTILITIES - Prevent torn reads of shared state
 # ============================================================================
-# These functions use flock to ensure atomic reads/writes to temp files
-# This prevents corruption when multiple background processes access the same files
+# Background jobs write per-server state files that the dashboard reads
+# concurrently. We rely on rename(2) being atomic on a single filesystem: a
+# writer stages content in a unique temp file and renames it into place, so a
+# concurrent reader always sees either the previous file or the fully-written
+# new one -- never an empty or half-written file. This is cheaper than flock
+# (no lock file, no extra fork per read) and gives the same safety here, since
+# writes are whole-file and last-writer-wins is the desired semantics.
 
-# Function to safely write to a file with flock protection
+# Function to atomically write content to a file
 # Parameters: $1 = file path, $2 = content to write
 # Returns: 0 on success, 1 on failure
 safe_write_file() {
     local file_path="$1"
     local content="$2"
 
-    # Use flock to get exclusive lock, then write atomically
-    # File descriptor 200 is arbitrary but consistent
-    {
-        flock -x 200 || return 1
-        echo "$content" > "$file_path"
-    } 200>"${file_path}.lock" 2>/dev/null || return 1
+    # Unique temp name so concurrent writers never collide on the staging file;
+    # the final rename is the only externally visible state change. $BASHPID (not
+    # $$) is the *real* PID of this process -- background jobs run in subshells
+    # where $$ still holds the parent's PID, so $BASHPID is what makes the name
+    # unique per writer. Requires bash 4.0+, which this script already mandates
+    # (associative arrays).
+    local tmp="${file_path}.$BASHPID.tmp"
+    echo "$content" > "$tmp" 2>/dev/null || { rm -f "$tmp" 2>/dev/null; return 1; }
+    mv -f "$tmp" "$file_path" 2>/dev/null || { rm -f "$tmp" 2>/dev/null; return 1; }
 }
 
-# Function to safely read from a file with flock protection
+# Function to read a file written by safe_write_file
 # Parameters: $1 = file path, $2 = default value if file doesn't exist (optional)
 # Returns: File content via stdout, or default value if file doesn't exist
 safe_read_file() {
     local file_path="$1"
     local default_value="${2:-}"
 
-    # If file doesn't exist, return default value
-    if [[ ! -f "$file_path" ]]; then
-        echo "$default_value"
-        return 0
-    fi
-
-    # Use flock to get shared lock, then read
-    local content
-    {
-        flock -s 200 || return 1
-        content=$(cat "$file_path" 2>/dev/null || echo "$default_value")
-    } 200>"${file_path}.lock" 2>/dev/null
-
-    echo "$content"
-    return 0
+    # No lock needed: atomic-rename writes guarantee we never observe a partial
+    # file. No -f pre-check either -- that would be TOCTOU (the file can vanish
+    # between the test and the read); cat failure falls through to the default.
+    cat "$file_path" 2>/dev/null || echo "$default_value"
 }
 
 # ============================================================================
@@ -585,21 +582,82 @@ gather_system_info() {
 
     local os_info kernel_ver
 
+    # OS name is resolved through a fallback chain so pre-systemd distros still
+    # populate the dashboard:
+    #   1. /etc/os-release PRETTY_NAME  (systemd era: RHEL/CentOS 7+, Debian 8+)
+    #   2. lsb_release -d               (if the lsb package is installed)
+    #   3. /etc/redhat-release          (CentOS/RHEL 6 and older have no os-release)
+    # Later steps only run when earlier ones yield nothing, so modern hosts still
+    # resolve in a single probe.
     if [[ -n "$ssh_cmd" ]]; then
         os_info=$($ssh_cmd "$server" "grep '^PRETTY_NAME=' /etc/os-release 2>/dev/null | cut -d'\"' -f2" 2>/dev/null || echo "Unknown")
         if [[ "$os_info" == "Unknown" || -z "$os_info" ]]; then
             os_info=$($ssh_cmd "$server" "lsb_release -d 2>/dev/null | cut -f2" 2>/dev/null || echo "Unknown")
         fi
+        if [[ "$os_info" == "Unknown" || -z "$os_info" ]]; then
+            os_info=$($ssh_cmd "$server" "cat /etc/redhat-release 2>/dev/null" 2>/dev/null || echo "Unknown")
+        fi
         kernel_ver=$($ssh_cmd "$server" "uname -r" 2>/dev/null || echo "Unknown")
     else
-        # Localhost: direct commands
+        # Localhost: same fallback chain, run directly.
         os_info=$(grep '^PRETTY_NAME=' /etc/os-release 2>/dev/null | cut -d'"' -f2 || echo "Unknown")
+        if [[ "$os_info" == "Unknown" || -z "$os_info" ]]; then
+            os_info=$(lsb_release -d 2>/dev/null | cut -f2 || echo "Unknown")
+        fi
+        if [[ "$os_info" == "Unknown" || -z "$os_info" ]]; then
+            os_info=$(cat /etc/redhat-release 2>/dev/null || echo "Unknown")
+        fi
         kernel_ver=$(uname -r 2>/dev/null || echo "Unknown")
     fi
+
+    # Normalize empty results so the dashboard shows "--" rather than a blank.
+    [[ -z "$os_info" ]] && os_info="Unknown"
+    [[ -z "$kernel_ver" ]] && kernel_ver="Unknown"
 
     # Write to temp files so background processes can share this info
     safe_write_file "$TEMP_DIR/${server}.os_release" "$os_info"
     safe_write_file "$TEMP_DIR/${server}.kernel" "$kernel_ver"
+}
+
+# Controller-side SSH option fragments, filled in by detect_ssh_capabilities().
+# These gate on the *local* client's OpenSSH version because they are all
+# client-side options; remote targets only need to speak SSH-2 (every OpenSSH
+# since 2.x does), so an ancient target like CentOS 6 is always fine to manage.
+# Defaults are the lowest-common-denominator (works back to OpenSSH 5.x) and are
+# upgraded in place once we know the client supports more.
+SSH_HOSTKEY_OPT="-o StrictHostKeyChecking=no"
+SSH_MUX_OPTS=""
+
+# Function to detect what the *local* ssh client supports, run once at startup.
+# Side effects: sets SSH_HOSTKEY_OPT and SSH_MUX_OPTS globals.
+detect_ssh_capabilities() {
+    # `ssh -V` prints to stderr, e.g. "OpenSSH_8.0p1, OpenSSL ...".
+    local ver_line major=0 minor=0
+    ver_line=$(ssh -V 2>&1)
+    if [[ "$ver_line" =~ OpenSSH_([0-9]+)\.([0-9]+) ]]; then
+        major="${BASH_REMATCH[1]}"
+        minor="${BASH_REMATCH[2]}"
+    fi
+    local ver=$((major * 100 + minor))  # encode as M*100+m: 7.6 -> 706, 6.7 -> 607
+
+    # Host key policy: accept-new (TOFU without prompting) needs OpenSSH 7.6.
+    # Older clients only understand yes/no/ask, so fall back to no (the script's
+    # historical behavior) rather than erroring out on an unknown value.
+    if (( ver >= 706 )); then
+        SSH_HOSTKEY_OPT="-o StrictHostKeyChecking=accept-new"
+    else
+        SSH_HOSTKEY_OPT="-o StrictHostKeyChecking=no"
+    fi
+
+    # Connection multiplexing needs the ControlPath %C token (OpenSSH 6.7) and
+    # ControlPersist (5.6). %C is the binding constraint. If the client is older
+    # (e.g. CentOS 6's 5.3), skip multiplexing entirely: correct, just one
+    # handshake per command like before pooling existed.
+    if (( ver >= 607 )); then
+        SSH_MUX_OPTS="-o ControlMaster=auto -o ControlPath=$SSH_CONTROL_DIR/cm-%C -o ControlPersist=600"
+    else
+        SSH_MUX_OPTS=""
+    fi
 }
 
 # Function to get SSH command with port and options
@@ -615,14 +673,12 @@ get_ssh_cmd() {
         return
     fi
 
-    # ControlMaster=auto reuses one TCP/SSH session per (user,host,port) for the
-    # script's lifetime, cutting per-call handshakes from O(commands) to ~1.
-    # Multiplexing is purely client-side, so target servers don't need anything
-    # beyond standard SSH-2; if the master can't open for any reason, auto-mode
-    # silently degrades to a direct connection.
-    # Note: StrictHostKeyChecking=accept-new and ControlPath %C both require
-    # OpenSSH 6.7+ on the *local* client (the script's host).
-    local base_ssh="ssh -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 -o ControlMaster=auto -o ControlPath=$SSH_CONTROL_DIR/cm-%C -o ControlPersist=600"
+    # Option set is chosen by detect_ssh_capabilities() based on the local ssh
+    # version. SSH_MUX_OPTS is empty on pre-6.7 clients (multiplexing disabled),
+    # and SSH_HOSTKEY_OPT degrades accept-new -> no on pre-7.6 clients. When mux
+    # is enabled it reuses one session per (user,host,port) for the script's
+    # lifetime; if a master can't open, auto-mode degrades to a direct connection.
+    local base_ssh="ssh $SSH_HOSTKEY_OPT -o ConnectTimeout=10 $SSH_MUX_OPTS"
     if [[ -n "${SERVER_PORTS[$server]}" ]]; then
         echo "$base_ssh -p ${SERVER_PORTS[$server]}"
     else
@@ -781,7 +837,6 @@ draw_dashboard() {
     for server in "${SERVERS[@]}"; do
         local status_file="$TEMP_DIR/${server}.status"
 
-        # Read status file with flock protection
         local status
         status=$(safe_read_file "$status_file" "Pending")
 
@@ -802,7 +857,7 @@ draw_dashboard() {
         local display_name
         display_name=$(get_display_name "$server")
 
-        # Get OS and kernel info from temp files with flock protection
+        # Get OS and kernel info from temp files
         local os_info
         local kernel_info
 
@@ -1190,6 +1245,11 @@ for server in "${SERVERS[@]}"; do
 done
 echo ""
 
+# Probe the local ssh client once so get_ssh_cmd builds options it actually
+# supports (handles old controllers like CentOS 6/7 whose ssh predates
+# accept-new / ControlPath %C).
+detect_ssh_capabilities
+
 # Skip interactive prompt in automated modes
 if [[ "$NON_INTERACTIVE" == true || "$CHECK_ONLY" == true || "$ASSUME_YES" == true ]]; then
     echo -e "${CYAN}Starting update check (automated mode)...${NC}"
@@ -1258,7 +1318,6 @@ for server in "${SERVERS[@]}"; do
         continue
     fi
 
-    # Read status with flock protection
     status=$(safe_read_file "$status_file" "Unknown")
 
     # Skip servers with errors or no updates
