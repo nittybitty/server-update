@@ -8,15 +8,41 @@ umask 077
 # Server Update Dashboard
 # Version: 1.4 (Refactored)
 
-# Color definitions for output
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-BLUE='\033[0;34m'
-CYAN='\033[0;36m'
-MAGENTA='\033[0;35m'
-BOLD='\033[1m'
-NC='\033[0m' # No Color
+# Terminal detection: colors and the live dashboard only make sense on a real
+# terminal. When stdout is a pipe or cron job, escape codes just pollute logs.
+if [[ -t 1 ]]; then
+    IS_TTY=true
+else
+    IS_TTY=false
+fi
+
+# Color definitions for output (honors NO_COLOR, per https://no-color.org)
+if [[ "$IS_TTY" == true && -z "${NO_COLOR:-}" ]]; then
+    RED='\033[0;31m'
+    GREEN='\033[0;32m'
+    YELLOW='\033[1;33m'
+    BLUE='\033[0;34m'
+    CYAN='\033[0;36m'
+    MAGENTA='\033[0;35m'
+    BOLD='\033[1m'
+    NC='\033[0m' # No Color
+else
+    RED=''; GREEN=''; YELLOW=''; BLUE=''; CYAN=''; MAGENTA=''; BOLD=''; NC=''
+fi
+
+# Status glyphs: UTF-8 symbols only when the locale can render them. Old-distro
+# consoles and LANG=C sessions (common on CentOS 6/7) show mojibake otherwise.
+if [[ "$(locale charmap 2>/dev/null)" == "UTF-8" ]]; then
+    GLYPH_OK="✓"
+    GLYPH_FAIL="✗"
+    GLYPH_WARN="⚠"
+    GLYPH_BULLET="•"
+else
+    GLYPH_OK="[OK]"
+    GLYPH_FAIL="[X]"
+    GLYPH_WARN="[!]"
+    GLYPH_BULLET="*"
+fi
 
 # Configuration
 SERVER_LIST="server_list.txt"
@@ -40,6 +66,11 @@ REBOOT_MAX_WAIT=900
 REBOOT_WAIT_INTERVAL=30
 # DASHBOARD_REFRESH: Seconds between dashboard refreshes (default: 1 second)
 DASHBOARD_REFRESH=1
+# APPLY_TIMEOUT: Maximum time (seconds) for the actual update run in Phase 3/4
+# (default: 3600 = 1 hour). Separate from DNF_TIMEOUT (the check phase): big
+# updates on old/slow hardware routinely exceed 10 minutes, and killing a
+# package transaction mid-flight risks rpmdb/dpkg corruption.
+APPLY_TIMEOUT=3600
 
 # Function to safely load configuration file
 # This prevents arbitrary code execution by only parsing specific variable assignments
@@ -57,10 +88,12 @@ load_config() {
     fi
 
     # Whitelist of allowed configuration variables
-    local allowed_vars=("DNF_TIMEOUT" "KERNEL_PACKAGE_REGEX" "KERNEL_UPDATE_REGEX" "REBOOT_MAX_WAIT" "REBOOT_WAIT_INTERVAL" "DASHBOARD_REFRESH")
+    local allowed_vars=("DNF_TIMEOUT" "APPLY_TIMEOUT" "KERNEL_PACKAGE_REGEX" "KERNEL_UPDATE_REGEX" "REBOOT_MAX_WAIT" "REBOOT_WAIT_INTERVAL" "DASHBOARD_REFRESH")
 
-    # Parse config file safely - only allow whitelisted variable assignments
-    while IFS='=' read -r key value; do
+    # Parse config file safely - only allow whitelisted variable assignments.
+    # The `|| [[ -n "$key" ]]` guard still processes a final line that lacks a
+    # trailing newline (read returns nonzero but has filled the variables).
+    while IFS='=' read -r key value || [[ -n "$key" ]]; do
         # Skip comments and empty lines
         [[ "$key" =~ ^[[:space:]]*# ]] && continue
         [[ -z "$key" ]] && continue
@@ -89,23 +122,34 @@ load_config() {
                         echo -e "${YELLOW}[WARNING]${NC} Value for $key is too large (max: 604800 seconds). Using default."
                         continue
                     fi
+                    # Reject zero: REBOOT_WAIT_INTERVAL=0 would divide by zero
+                    # and DASHBOARD_REFRESH=0 would busy-loop
+                    if [[ "$value" -lt 1 ]]; then
+                        echo -e "${YELLOW}[WARNING]${NC} Value for $key must be at least 1. Using default."
+                        continue
+                    fi
                 fi
 
                 # Validate regex patterns with ReDoS protection
                 if [[ "$key" =~ REGEX ]]; then
-                    # Test regex with timeout to prevent catastrophic backtracking
-                    if ! timeout 1s bash -c "echo 'kernel-core-5.14.0' | grep -E '$value' >/dev/null 2>&1"; then
-                        regex_exit=$?
-                        # Exit codes: 0=match, 1=no match, 2+=error, 124=timeout
-                        if [[ $regex_exit -ge 2 || $regex_exit -eq 124 ]]; then
-                            echo -e "${YELLOW}[WARNING]${NC} Invalid or dangerous regex pattern for $key in config file. Using default."
-                            continue
-                        fi
+                    # Test regex with timeout to prevent catastrophic backtracking.
+                    # The pattern is passed as an argument (never interpolated into
+                    # a shell string), so config values cannot inject commands here.
+                    # Capture $? directly: the old `if ! cmd; then regex_exit=$?`
+                    # form read the NEGATED status (always 0), so broken regexes
+                    # were never actually rejected.
+                    timeout 1s grep -E -- "$value" >/dev/null 2>&1 <<< "kernel-core-5.14.0"
+                    regex_exit=$?
+                    # Exit codes: 0=match, 1=no match, 2+=error, 124=timeout
+                    if [[ $regex_exit -ge 2 || $regex_exit -eq 124 ]]; then
+                        echo -e "${YELLOW}[WARNING]${NC} Invalid or dangerous regex pattern for $key in config file. Using default."
+                        continue
                     fi
                 fi
 
-                # Assign the validated value (compatible with Bash 3.x+)
-                eval "$key=\"$value\""
+                # Assign the validated value. printf -v cannot execute the
+                # value -- unlike eval, which ran $(...) embedded in config values
+                printf -v "$key" '%s' "$value"
                 break
             fi
         done
@@ -118,9 +162,14 @@ load_config
 # ============================================================================
 # INSTANCE LOCKING - Prevent multiple instances from running simultaneously
 # ============================================================================
-# Check if another instance is already running
-if [[ -f "$LOCK_FILE" ]]; then
-    # Read PID from lock file
+# Atomic lock acquisition: noclobber turns the redirection into O_CREAT|O_EXCL,
+# so two instances racing here can't both win (the old check-then-create had a
+# window), and a pre-planted symlink at the lock path is not followed.
+acquire_lock() {
+    (set -o noclobber; echo "$$" > "$LOCK_FILE") 2>/dev/null
+}
+
+if ! acquire_lock; then
     existing_pid=$(cat "$LOCK_FILE" 2>/dev/null)
 
     # Check if that PID is still running
@@ -130,19 +179,16 @@ if [[ -f "$LOCK_FILE" ]]; then
         echo -e "${YELLOW}[INFO]${NC} If you're sure no other instance is running, remove the lock file:"
         echo -e "${YELLOW}[INFO]${NC}   rm $LOCK_FILE"
         exit 1
-    else
-        # Stale lock file (process no longer exists)
-        echo -e "${YELLOW}[WARNING]${NC} Removing stale lock file from PID $existing_pid"
-        rm -f "$LOCK_FILE"
     fi
-fi
 
-# Create lock file with our PID
-echo $$ > "$LOCK_FILE"
-if [[ $? -ne 0 ]]; then
-    echo -e "${RED}[ERROR]${NC} Failed to create lock file: $LOCK_FILE"
-    echo -e "${YELLOW}[INFO]${NC} Check permissions on /tmp directory"
-    exit 1
+    # Stale lock file (process no longer exists, or unreadable/empty file)
+    echo -e "${YELLOW}[WARNING]${NC} Removing stale lock file from PID ${existing_pid:-unknown}"
+    rm -f "$LOCK_FILE"
+    if ! acquire_lock; then
+        echo -e "${RED}[ERROR]${NC} Failed to create lock file: $LOCK_FILE"
+        echo -e "${YELLOW}[INFO]${NC} Check permissions on /tmp directory"
+        exit 1
+    fi
 fi
 
 # Create temporary directory with secure permissions (700 - owner only)
@@ -231,6 +277,17 @@ validate_ip() {
     return 1
 }
 
+# Function to check whether a server entry refers to this machine.
+# Phase 2/3 must skip every local alias -- not just the literal "localhost" --
+# or a kernel update on a "127.0.0.1" entry would reboot the control host
+# mid-run while other servers are still being monitored. Phase 4 handles the
+# local machine last, after all remotes are done.
+# Parameters: $1 = server address
+# Returns: 0 if local, 1 otherwise
+is_localhost() {
+    [[ "$1" == "localhost" || "$1" == "127.0.0.1" || "$1" == "::1" ]]
+}
+
 # ============================================================================
 # ATOMIC TEMP FILE UTILITIES - Prevent torn reads of shared state
 # ============================================================================
@@ -260,17 +317,30 @@ safe_write_file() {
     mv -f "$tmp" "$file_path" 2>/dev/null || { rm -f "$tmp" 2>/dev/null; return 1; }
 }
 
-# Function to read a file written by safe_write_file
-# Parameters: $1 = file path, $2 = default value if file doesn't exist (optional)
-# Returns: File content via stdout, or default value if file doesn't exist
+# Function to read a single-line state file written by safe_write_file.
+# Parameters: $1 = file path, $2 = default value if file is missing (optional)
+# Returns: result in the global SRF_RESULT (NOT stdout).
+#
+# Why a global instead of echoing through stdout: the dashboard reads 3 files per
+# server on every refresh, and `var=$(safe_read_file ...)` forks a subshell for
+# the command substitution each time. Writing into a global lets hot callers skip
+# that fork entirely. Combined with the `read` builtin (no `cat` exec), this is
+# ~40x cheaper per read than the old `cat` + `$()` form. A plain global is used
+# rather than a `declare -n` nameref so this still runs on the bash 4.0-4.2
+# controllers (CentOS/RHEL 6/7) that v1.4 restored support for.
+#
+# Correctness: state files are single-line and safe_write_file always appends a
+# trailing newline (echo), so `read` returns 0 and captures the whole value.
+# Atomic-rename writes mean we never observe a partial/torn file, so a missing
+# file is the only failure mode -- the input redirection fails and we fall back
+# to the default. stderr is redirected *before* the input redirection so the
+# shell's "No such file" message is swallowed.
+SRF_RESULT=""
 safe_read_file() {
     local file_path="$1"
     local default_value="${2:-}"
 
-    # No lock needed: atomic-rename writes guarantee we never observe a partial
-    # file. No -f pre-check either -- that would be TOCTOU (the file can vanish
-    # between the test and the read); cat failure falls through to the default.
-    cat "$file_path" 2>/dev/null || echo "$default_value"
+    IFS= read -r SRF_RESULT 2>/dev/null < "$file_path" || SRF_RESULT="$default_value"
 }
 
 # ============================================================================
@@ -308,7 +378,8 @@ print_info() {
 get_pkg_manager() {
     local server="$1"
     if [[ -z "${PKG_MANAGER_CACHE[$server]}" ]]; then
-        PKG_MANAGER_CACHE[$server]=$(safe_read_file "$TEMP_DIR/${server}.pkg_manager" "unknown")
+        safe_read_file "$TEMP_DIR/${server}.pkg_manager" "unknown"
+        PKG_MANAGER_CACHE[$server]="$SRF_RESULT"
     fi
     echo "${PKG_MANAGER_CACHE[$server]}"
 }
@@ -323,8 +394,10 @@ get_display_name() {
 }
 
 # Filter apt output header (Issue #12)
+# Unanchored at the end: with a tty apt prints "Listing... Done", without one
+# just "Listing...". Package lines can't false-match (they start with "name/").
 filter_apt_header() {
-    grep -v "^Listing\.\.\.$" "$@"
+    grep -v "^Listing\.\.\." "$@"
 }
 
 # ============================================================================
@@ -347,6 +420,10 @@ show_help() {
     echo "  Server list: $SERVER_LIST"
     echo "  Log file:    $LOG_FILE"
     echo "  Config file: server_update.conf (optional)"
+    echo ""
+    echo "Environment:"
+    echo "  NO_COLOR           Disable colored output (also disabled when stdout"
+    echo "                     is not a terminal)"
     echo ""
     echo "For more information, see CLAUDE.md"
     exit 0
@@ -404,6 +481,9 @@ done
 
 # Cleanup function to run on exit
 cleanup() {
+    # Restore the cursor if the dashboard hid it (e.g. Ctrl-C mid-refresh)
+    [[ "${IS_TTY:-false}" == true ]] && printf '\033[?25h'
+
     # Kill all background jobs spawned by this script
     # This prevents orphaned dnf/yum processes that can hang future runs
     local jobs_list
@@ -476,7 +556,10 @@ declare -A DISPLAY_NAME_CACHE
 
 line_number=0
 
-while read -r -a parts; do
+# The `|| [[ ${#parts[@]} -gt 0 ]]` guard still processes a final line that
+# lacks a trailing newline (read returns nonzero but has filled the array) --
+# previously the last server in such a file was silently dropped.
+while read -r -a parts || [[ ${#parts[@]} -gt 0 ]]; do
     ((line_number++))
 
     # Skip empty lines and lines starting with #
@@ -531,6 +614,14 @@ while read -r -a parts; do
         fi
     fi
 
+    # Reject duplicate server addresses - the keyed arrays would silently
+    # merge them (last nickname/port wins) and the host would be updated
+    # twice in parallel
+    if [[ -n "${SERVER_NICKNAMES[$server]}" ]]; then
+        echo -e "${YELLOW}[WARNING]${NC} Line $line_number: Duplicate entry for '$server', skipping"
+        continue
+    fi
+
     # Add validated server to arrays
     SERVERS+=("$server")
     SERVER_NICKNAMES["$server"]="$nickname"
@@ -572,51 +663,115 @@ fi'
     echo "${result:-unknown}"
 }
 
-# Function to gather system information (OS release and kernel version)
+# Function to discover a server in a single SSH round-trip: package manager,
+# OS release, and kernel version all at once. This replaces what used to be a
+# separate connection test + detect_package_manager + 2-4 gather_system_info
+# round-trips (the discovery "N+1"). Because the remote snippet always prints a
+# "PM=" line, its presence in the output doubles as the connection test -- if the
+# connection or remote shell failed, there is no "PM=" to find.
+#
 # Parameters: $1 = server address
-# Side effects: Writes OS and kernel info to temp files
-gather_system_info() {
+# Side effects: writes ${server}.pkg_manager, ${server}.os_release, ${server}.kernel
+# Returns: 0 on success, 124 on timeout, 1 on connection/other failure
+probe_server_info() {
     local server="$1"
     local ssh_cmd
     ssh_cmd=$(get_ssh_cmd "$server")
 
-    local os_info kernel_ver
+    # POSIX-sh remote snippet (a remote /bin/sh may be dash, not bash). It is
+    # written with NO single quotes so the whole thing can be passed as one
+    # single-quoted bash argument. Package manager order matches the old
+    # detect_package_manager: apt (Debian/Ubuntu), then dnf (RHEL 8+/Fedora),
+    # then yum (RHEL 7). OS name uses the same fallback chain as before --
+    # /etc/os-release PRETTY_NAME -> lsb_release -d -> /etc/redhat-release -- so
+    # pre-systemd hosts (CentOS/RHEL 6) still populate the column. The PRETTY_NAME
+    # value is unwrapped with prefix/suffix stripping rather than `cut -d'"'`,
+    # which also handles unquoted values (e.g. PRETTY_NAME=Fedora).
+    local probe='pm=unknown
+if command -v apt-get >/dev/null 2>&1; then pm=apt
+elif command -v dnf >/dev/null 2>&1; then pm=dnf
+elif command -v yum >/dev/null 2>&1; then pm=yum
+fi
+os=$(grep "^PRETTY_NAME=" /etc/os-release 2>/dev/null | head -n 1)
+os=${os#PRETTY_NAME=}
+os=${os#\"}
+os=${os%\"}
+[ -z "$os" ] && os=$(lsb_release -d 2>/dev/null | cut -f2)
+[ -z "$os" ] && os=$(cat /etc/redhat-release 2>/dev/null)
+[ -z "$os" ] && os=Unknown
+kn=$(uname -r 2>/dev/null || echo Unknown)
+printf "PM=%s\n" "$pm"
+printf "OS=%s\n" "$os"
+printf "KERNEL=%s\n" "$kn"'
 
-    # OS name is resolved through a fallback chain so pre-systemd distros still
-    # populate the dashboard:
-    #   1. /etc/os-release PRETTY_NAME  (systemd era: RHEL/CentOS 7+, Debian 8+)
-    #   2. lsb_release -d               (if the lsb package is installed)
-    #   3. /etc/redhat-release          (CentOS/RHEL 6 and older have no os-release)
-    # Later steps only run when earlier ones yield nothing, so modern hosts still
-    # resolve in a single probe.
+    # 15s overall cap matches the old connection test. ssh's own ConnectTimeout=10
+    # fires first on an unreachable host (exit 255); a hang past 15s yields 124.
+    # ssh stderr is kept (not discarded) so connection failures can be classified
+    # and logged -- "Cannot connect" alone is useless when the real problem is an
+    # auth failure or a legacy-algorithm mismatch with an old sshd.
+    local output rc
     if [[ -n "$ssh_cmd" ]]; then
-        os_info=$($ssh_cmd "$server" "grep '^PRETTY_NAME=' /etc/os-release 2>/dev/null | cut -d'\"' -f2" 2>/dev/null || echo "Unknown")
-        if [[ "$os_info" == "Unknown" || -z "$os_info" ]]; then
-            os_info=$($ssh_cmd "$server" "lsb_release -d 2>/dev/null | cut -f2" 2>/dev/null || echo "Unknown")
-        fi
-        if [[ "$os_info" == "Unknown" || -z "$os_info" ]]; then
-            os_info=$($ssh_cmd "$server" "cat /etc/redhat-release 2>/dev/null" 2>/dev/null || echo "Unknown")
-        fi
-        kernel_ver=$($ssh_cmd "$server" "uname -r" 2>/dev/null || echo "Unknown")
+        # shellcheck disable=SC2086
+        output=$(timeout 15s $ssh_cmd "$server" "$probe" 2>"$TEMP_DIR/${server}.ssh_err")
+        rc=$?
     else
-        # Localhost: same fallback chain, run directly.
-        os_info=$(grep '^PRETTY_NAME=' /etc/os-release 2>/dev/null | cut -d'"' -f2 || echo "Unknown")
-        if [[ "$os_info" == "Unknown" || -z "$os_info" ]]; then
-            os_info=$(lsb_release -d 2>/dev/null | cut -f2 || echo "Unknown")
-        fi
-        if [[ "$os_info" == "Unknown" || -z "$os_info" ]]; then
-            os_info=$(cat /etc/redhat-release 2>/dev/null || echo "Unknown")
-        fi
-        kernel_ver=$(uname -r 2>/dev/null || echo "Unknown")
+        output=$(timeout 15s bash -c "$probe" 2>/dev/null)
+        rc=$?
     fi
 
-    # Normalize empty results so the dashboard shows "--" rather than a blank.
+    if [[ $rc -eq 124 ]]; then
+        return 124
+    fi
+    # The PM= sentinel proves the remote shell actually ran. Without it the
+    # connection (or remote shell) failed, whatever the exit code.
+    if [[ "$output" != *"PM="* ]]; then
+        return 1
+    fi
+
+    # Split on the FIRST '=' only, so OS names containing '=', spaces, or parens
+    # survive intact.
+    local pm="unknown" os_info="Unknown" kernel_ver="Unknown" line
+    while IFS= read -r line; do
+        case "$line" in
+            PM=*)     pm="${line#PM=}" ;;
+            OS=*)     os_info="${line#OS=}" ;;
+            KERNEL=*) kernel_ver="${line#KERNEL=}" ;;
+        esac
+    done <<< "$output"
+
+    # Normalize empties so the dashboard shows "--"/"unknown" rather than blanks.
+    [[ -z "$pm" ]] && pm="unknown"
     [[ -z "$os_info" ]] && os_info="Unknown"
     [[ -z "$kernel_ver" ]] && kernel_ver="Unknown"
 
-    # Write to temp files so background processes can share this info
+    safe_write_file "$TEMP_DIR/${server}.pkg_manager" "$pm"
     safe_write_file "$TEMP_DIR/${server}.os_release" "$os_info"
     safe_write_file "$TEMP_DIR/${server}.kernel" "$kernel_ver"
+    return 0
+}
+
+# Function to map ssh stderr to a short human-readable reason for the dashboard.
+# Old targets are a common trip-wire here: OpenSSH 8.8+ controllers disable
+# ssh-rsa/SHA-1 by default, so a CentOS 6 sshd fails algorithm negotiation --
+# without this the user just sees a generic "Cannot connect".
+# Parameters: $1 = path to captured ssh stderr file
+# Returns: reason in the global SSH_ERROR_REASON ("" if unrecognized)
+SSH_ERROR_REASON=""
+classify_ssh_error() {
+    local err=""
+    [[ -f "$1" ]] && err=$(<"$1")
+
+    SSH_ERROR_REASON=""
+    case "$err" in
+        *"Permission denied"*)                  SSH_ERROR_REASON="auth failed" ;;
+        *"no matching"*)                        SSH_ERROR_REASON="SSH algorithm mismatch (legacy host?)" ;;
+        *"IDENTIFICATION HAS CHANGED"*)         SSH_ERROR_REASON="host key changed" ;;
+        *"Host key verification failed"*)       SSH_ERROR_REASON="host key verification failed" ;;
+        *"Could not resolve"*)                  SSH_ERROR_REASON="DNS lookup failed" ;;
+        *"Connection refused"*)                 SSH_ERROR_REASON="connection refused" ;;
+        *"Connection timed out"*|*"timed out"*) SSH_ERROR_REASON="connection timed out" ;;
+        *"Network is unreachable"*)             SSH_ERROR_REASON="network unreachable" ;;
+    esac
 }
 
 # Controller-side SSH option fragments, filled in by detect_ssh_capabilities().
@@ -667,8 +822,7 @@ get_ssh_cmd() {
     local server="$1"
 
     # For localhost, don't use SSH (Fix: Issue #28 - better localhost detection)
-    # Check if server is truly localhost (127.0.0.1, ::1, or localhost)
-    if [[ "$server" == "localhost" || "$server" == "127.0.0.1" || "$server" == "::1" ]]; then
+    if is_localhost "$server"; then
         echo ""
         return
     fi
@@ -786,107 +940,190 @@ has_kernel_package() {
     local text="$1"
     local pkg_manager="${2:-dnf}"
 
+    # Select the kernel pattern: apt uses fixed package prefixes; dnf/yum use the
+    # configurable KERNEL_PACKAGE_REGEX.
+    local regex
     case "$pkg_manager" in
-        apt)
-            # For apt/Debian, check for linux-image, linux-headers, linux-modules
-            echo "$text" | grep -qiE "(linux-image|linux-headers|linux-modules)"
-            ;;
-        *)
-            # For dnf/yum, use the configured KERNEL_PACKAGE_REGEX
-            echo "$text" | grep -qiE "$KERNEL_PACKAGE_REGEX"
-            ;;
+        apt) regex="(linux-image|linux-headers|linux-modules)" ;;
+        *)   regex="$KERNEL_PACKAGE_REGEX" ;;
     esac
-    return $?
+
+    # The Phase 2 review loops call this once per package line. For a single-line
+    # subject, match with the bash regex engine instead of forking grep per line
+    # (~200x cheaper per call). ^/$ anchors behave the same as grep's per-line
+    # match when the subject is one line. Multi-line blobs (whole-output scans)
+    # still go through grep, where ^/$ must anchor at each embedded newline --
+    # bash =~ would only anchor at the ends of the whole string.
+    if [[ "$text" == *$'\n'* ]]; then
+        # Strip leading indentation first: dnf/yum transaction tables indent
+        # package rows by one space, which defeated the ^kernel anchor in
+        # KERNEL_PACKAGE_REGEX (the Phase 2 kernel warning never fired for
+        # dnf/yum whole-output scans). Single-line callers get their input
+        # from `read`, which already strips leading whitespace.
+        echo "$text" | sed 's/^[[:space:]]*//' | grep -qiE "$regex"
+        return $?
+    fi
+
+    # Single line: replicate grep -i case-insensitivity via nocasematch, then
+    # restore the prior shell state (shopt -q is a builtin, so no fork).
+    local rc restore=0
+    shopt -q nocasematch || { shopt -s nocasematch; restore=1; }
+    [[ "$text" =~ $regex ]]; rc=$?
+    (( restore )) && shopt -u nocasematch
+    return $rc
 }
 
-# Function to parse DNF output and extract package counts
-# Parameters: $1 = dnf output text
+# Function to parse DNF/YUM output and extract package counts
+# Transaction Summary lines vary by generation: dnf and RHEL 7 yum say
+# "Install/Upgrade N Package(s)", but RHEL 6 yum says "Update N Package(s)" --
+# the old Install/Upgrade-only grep undercounted there. One awk pass sums all
+# three ("+0" guarantees a numeric result even with no matches).
+# Parameters: $1 = dnf/yum output text
 # Returns: Total count of packages to install/upgrade (echoed to stdout)
 parse_dnf_package_count() {
     local dnf_output="$1"
-    local install_count upgrade_count total_count
+    echo "$dnf_output" | awk '/^(Install|Upgrade|Update)[[:space:]]/ {s+=$2} END {print s+0}'
+}
 
-    install_count=$(echo "$dnf_output" | grep "^Install " | awk '{print $2}')
-    upgrade_count=$(echo "$dnf_output" | grep "^Upgrade " | awk '{print $2}')
+# Terminal width detection with a safe fallback (old consoles, cron without
+# TERM set). Result in the global TERM_WIDTH.
+get_term_width() {
+    local w
+    w=$(tput cols 2>/dev/null)
+    if [[ "$w" =~ ^[0-9]+$ ]] && (( w >= 40 )); then
+        TERM_WIDTH=$w
+    else
+        TERM_WIDTH=80
+    fi
+}
 
-    total_count=0
-    [[ -n "$install_count" ]] && total_count=$((total_count + install_count))
-    [[ -n "$upgrade_count" ]] && total_count=$((total_count + upgrade_count))
+# Pick column widths that fit the terminal. Old-distro consoles, serial lines,
+# and default PuTTY windows are 80 columns; the previous fixed 133-wide layout
+# wrapped every row there and turned the refresh into unreadable churn.
+# Parameters: $1 = terminal width
+# Side effects: sets COL_SRV, COL_OS, COL_KRN, COL_STS globals
+compute_dashboard_layout() {
+    local w="$1"
+    if (( w >= 133 )); then
+        COL_SRV=30; COL_OS=32; COL_KRN=28
+    elif (( w >= 110 )); then
+        COL_SRV=26; COL_OS=24; COL_KRN=22
+    elif (( w >= 92 )); then
+        COL_SRV=22; COL_OS=20; COL_KRN=16
+    else
+        COL_SRV=20; COL_OS=16; COL_KRN=12
+    fi
+    COL_STS=$((w - COL_SRV - COL_OS - COL_KRN - 3))
+    (( COL_STS > 45 )) && COL_STS=45
+    (( COL_STS < 12 )) && COL_STS=12
+}
 
-    echo "$total_count"
+# Truncate $1 to $2 characters with a "..." marker. Result in the global
+# TRUNC_RESULT (same fork-free return pattern as safe_read_file).
+truncate_field() {
+    local s="$1" w="$2"
+    if (( ${#s} > w )); then
+        TRUNC_RESULT="${s:0:w-3}..."
+    else
+        TRUNC_RESULT="$s"
+    fi
 }
 
 # Function to draw the live-updating dashboard showing all server statuses
-# This clears the screen and displays a formatted table of servers and their current status
+# Repaints in place: cursor-home plus erase-to-end-of-line per row (\033[K)
+# instead of a full-screen clear, so the 1s refresh doesn't flicker on slow
+# terminals. Width-aware: columns scale down to fit 80-column consoles. When
+# stdout is not a tty (cron/pipes) it prints a plain table, no escape codes.
 # Status is read from temporary status files written by update_status()
 # No parameters required - reads from global SERVERS array
 draw_dashboard() {
-    # Clear screen
-    printf "\033[H\033[2J"
+    local eol=""
+    if [[ "$IS_TTY" == true ]]; then
+        printf '\033[H'
+        eol=$'\033[K'
+    fi
 
-    # Draw header (Fix: Issue #36 - Use ASCII instead of Unicode)
-    echo -e "${BOLD}${BLUE}+==================================================================================================================================+${NC}"
-    echo -e "${BOLD}${BLUE}|                                        SERVER UPDATE DASHBOARD                                                                  |${NC}"
-    echo -e "${BOLD}${BLUE}+==================================================================================================================================+${NC}"
+    get_term_width
+    compute_dashboard_layout "$TERM_WIDTH"
+
+    # Header banner sized to the terminal
+    local box sep title pad
+    printf -v box '%*s' "$TERM_WIDTH" ''
+    sep=${box// /-}
+    box=${box// /=}
+    title="SERVER UPDATE DASHBOARD"
+    pad=$(( (TERM_WIDTH - ${#title}) / 2 ))
+    (( pad < 0 )) && pad=0
+
+    echo -e "${BOLD}${BLUE}${box}${NC}${eol}"
+    printf "${BOLD}${BLUE}%*s%s${NC}%s\n" "$pad" '' "$title" "$eol"
+    echo -e "${BOLD}${BLUE}${box}${NC}${eol}"
 
     # Column headers
-    printf "\n${BOLD}%-30s %-32s %-28s %-40s${NC}\n" "SERVER" "OS DISTRIBUTION" "KERNEL VERSION" "STATUS"
-    echo -e "${BLUE}----------------------------------------------------------------------------------------------------------------------------------${NC}"
+    printf "%s\n" "$eol"
+    printf "${BOLD}%-*s %-*s %-*s %-*s${NC}%s\n" \
+        "$COL_SRV" "SERVER" "$COL_OS" "OS DISTRIBUTION" "$COL_KRN" "KERNEL VERSION" "$COL_STS" "STATUS" "$eol"
+    echo -e "${BLUE}${sep}${NC}${eol}"
+
+    # Tallies for the summary footer
+    local n_active=0 n_updates=0 n_done=0 n_err=0
 
     # Display status for each server
+    local server
     for server in "${SERVERS[@]}"; do
-        local status_file="$TEMP_DIR/${server}.status"
-
         local status
-        status=$(safe_read_file "$status_file" "Pending")
+        safe_read_file "$TEMP_DIR/${server}.status" "Pending"
+        status="$SRF_RESULT"
 
-        # Color code status based on keywords
+        # Color code status based on keywords, and tally for the footer
         local color="${CYAN}"
         case "$status" in
-            *"Checking"*) color="${CYAN}" ;;
-            *"Connected"*) color="${GREEN}" ;;
-            *"updates available"*) color="${YELLOW}" ;;
-            *"No updates"*) color="${GREEN}" ;;
-            *"ERROR"*|*"Error"*) color="${RED}" ;;
-            *"Updating"*|*"Applying"*) color="${MAGENTA}" ;;
-            *"Rebooting"*) color="${YELLOW}" ;;
-            *"Successfully rebooted"*|*"✓"*) color="${GREEN}" ;;
-            *"Complete"*) color="${GREEN}" ;;
+            *"ERROR"*|*"Error"*) color="${RED}"; ((n_err++)) ;;
+            *"updates available"*) color="${YELLOW}"; ((n_updates++)) ;;
+            *"No updates"*) color="${GREEN}"; ((n_done++)) ;;
+            *"Reboot complete"*|*"Successfully rebooted"*) color="${GREEN}"; ((n_done++)) ;;
+            *"Complete"*) color="${GREEN}"; ((n_done++)) ;;
+            *"Skipped"*|*"Displayed"*) color="${YELLOW}"; ((n_done++)) ;;
+            *"Updating"*|*"Applying"*) color="${MAGENTA}"; ((n_active++)) ;;
+            *"Rebooting"*) color="${YELLOW}"; ((n_active++)) ;;
+            *"Connected"*) color="${GREEN}"; ((n_active++)) ;;
+            *) color="${CYAN}"; ((n_active++)) ;;
         esac
 
-        local display_name
+        local display_name os_info kernel_info
         display_name=$(get_display_name "$server")
 
         # Get OS and kernel info from temp files
-        local os_info
-        local kernel_info
-
-        os_info=$(safe_read_file "$TEMP_DIR/${server}.os_release" "--")
-        kernel_info=$(safe_read_file "$TEMP_DIR/${server}.kernel" "--")
+        safe_read_file "$TEMP_DIR/${server}.os_release" "--"
+        os_info="$SRF_RESULT"
+        safe_read_file "$TEMP_DIR/${server}.kernel" "--"
+        kernel_info="$SRF_RESULT"
 
         # Don't show "Unknown"
         [[ "$os_info" == "Unknown" ]] && os_info="--"
         [[ "$kernel_info" == "Unknown" ]] && kernel_info="--"
 
-        # Truncate fields if too long
-        if [[ ${#display_name} -gt 29 ]]; then
-            display_name="${display_name:0:26}..."
-        fi
-        if [[ ${#os_info} -gt 31 ]]; then
-            os_info="${os_info:0:28}..."
-        fi
-        if [[ ${#kernel_info} -gt 27 ]]; then
-            kernel_info="${kernel_info:0:24}..."
-        fi
-        if [[ ${#status} -gt 39 ]]; then
-            status="${status:0:36}..."
-        fi
+        # Truncate fields to the computed column widths
+        truncate_field "$display_name" "$COL_SRV"; display_name="$TRUNC_RESULT"
+        truncate_field "$os_info" "$COL_OS"; os_info="$TRUNC_RESULT"
+        truncate_field "$kernel_info" "$COL_KRN"; kernel_info="$TRUNC_RESULT"
+        truncate_field "$status" "$COL_STS"; status="$TRUNC_RESULT"
 
         # Display single line with all info
-        printf "%-30s %-32s %-28s ${color}%-40s${NC}\n" "$display_name" "$os_info" "$kernel_info" "$status"
+        printf "%-*s %-*s %-*s ${color}%-*s${NC}%s\n" \
+            "$COL_SRV" "$display_name" "$COL_OS" "$os_info" "$COL_KRN" "$kernel_info" "$COL_STS" "$status" "$eol"
     done
 
-    echo -e "${BLUE}----------------------------------------------------------------------------------------------------------------------------------${NC}"
+    echo -e "${BLUE}${sep}${NC}${eol}"
+
+    # Summary footer with elapsed time for the current phase
+    local elapsed_s=$(( SECONDS - ${DASH_START:-0} )) elapsed
+    printf -v elapsed '%02d:%02d' $((elapsed_s / 60)) $((elapsed_s % 60))
+    printf "${BOLD}Active: %d | Updates: %d | Done: %d | Errors: %d | Elapsed: %s${NC}%s\n" \
+        "$n_active" "$n_updates" "$n_done" "$n_err" "$elapsed" "$eol"
+
+    # Erase any leftover lines from a previous, taller frame
+    [[ "$IS_TTY" == true ]] && printf '\033[0J'
 }
 
 # Function to update server status in temporary file (read by draw_dashboard)
@@ -910,31 +1147,30 @@ check_server_updates() {
 
     update_status "$server" "Checking connection..."
 
-    # Test SSH connection before proceeding (skip for localhost)
-    if [[ -n "$ssh_cmd" ]]; then
-        # Use timeout to prevent hanging on connection attempts
-        # shellcheck disable=SC2086
-        if ! timeout 15s $ssh_cmd "$server" "echo 'Connection successful'" &>/dev/null; then
-            local exit_code=$?
-            if [[ $exit_code -eq 124 ]]; then
-                update_status "$server" "ERROR: Connection timeout"
-                echo "$(date) - ERROR: Connection timeout to $server (15s)" >> "$LOG_FILE"
-            else
-                update_status "$server" "ERROR: Cannot connect"
-                echo "$(date) - ERROR: Connection failed to $server" >> "$LOG_FILE"
-            fi
-            return 1
+    # Single round-trip: connection test + package-manager detection + OS/kernel.
+    # Writes the pkg_manager/os_release/kernel temp files as a side effect.
+    probe_server_info "$server"
+    local probe_rc=$?
+    if [[ $probe_rc -eq 124 ]]; then
+        update_status "$server" "ERROR: Connection timeout"
+        echo "$(date) - ERROR: Connection timeout to $server (15s)" >> "$LOG_FILE"
+        return 1
+    elif [[ $probe_rc -ne 0 ]]; then
+        classify_ssh_error "$TEMP_DIR/${server}.ssh_err"
+        if [[ -n "$SSH_ERROR_REASON" ]]; then
+            update_status "$server" "ERROR: Cannot connect ($SSH_ERROR_REASON)"
+        else
+            update_status "$server" "ERROR: Cannot connect"
         fi
+        echo "$(date) - ERROR: Connection failed to $server${SSH_ERROR_REASON:+ ($SSH_ERROR_REASON)}" >> "$LOG_FILE"
+        # Keep the raw ssh stderr in the log for troubleshooting
+        head -5 "$TEMP_DIR/${server}.ssh_err" 2>/dev/null | sed 's/^/    ssh: /' >> "$LOG_FILE"
+        return 1
     fi
 
-    update_status "$server" "Connected - detecting system..."
-
-    # Detect package manager and gather system info
+    # Read back the package manager the probe just detected (cheap builtin read).
     local pkg_manager
-    pkg_manager=$(detect_package_manager "$server")
-    # Write to temp file (background processes can't modify parent arrays)
-    safe_write_file "$TEMP_DIR/${server}.pkg_manager" "$pkg_manager"
-    gather_system_info "$server"
+    pkg_manager=$(get_pkg_manager "$server")
 
     update_status "$server" "Connected - checking for updates ($pkg_manager)..."
 
@@ -952,7 +1188,11 @@ check_server_updates() {
             check_cmd="sudo dnf update --assumeno"
             ;;
         yum)
-            check_cmd="sudo yum update --assumeno"
+            # NOT --assumeno: that option needs yum 3.4.3 (RHEL 7), and RHEL 6's
+            # yum 3.2.29 dies with "no such option". Piping "n" answers the
+            # confirmation prompt on every yum version and produces the same
+            # transaction preview.
+            check_cmd="echo n | sudo yum update"
             ;;
         *)
             update_status "$server" "ERROR: No supported package manager found"
@@ -998,7 +1238,9 @@ check_server_updates() {
     case "$pkg_manager" in
         apt)
             # Count upgradeable packages (excluding the "Listing..." header) (Fix: Issue #29)
-            total_count=$(echo "$pkg_output" | filter_apt_header | grep -c "/" || echo 0)
+            # No `|| echo 0` here: grep -c already prints 0 on no match, and the
+            # fallback produced a second "0" line that broke the -gt comparison
+            total_count=$(echo "$pkg_output" | filter_apt_header | grep -c "/")
             if [[ $total_count -gt 0 ]]; then
                 update_status "$server" "${total_count} updates available"
                 return 0
@@ -1026,14 +1268,21 @@ check_server_updates() {
 }
 
 # Function to monitor server reboot process and verify it comes back online
-# This function performs a two-phase check:
-#   Phase 1: Wait for server to go down (become unreachable)
-#   Phase 2: Wait for server to come back up and be fully responsive
-# Parameters: $1 = server address
+# Primary strategy: /proc/sys/kernel/random/boot_id comparison. The kernel
+# regenerates boot_id on every boot, so a changed value PROVES a reboot
+# happened -- even one too fast to observe as "down" (small VMs can cycle
+# inside a 5s polling window, which the old down/up watcher misread as
+# "did not go down"). procfs has boot_id on any Linux back to RHEL 5, so old
+# targets are fine.
+# Fallback (no boot_id captured): legacy two-phase down/up polling.
+# All SSH probes are wrapped in `timeout` -- ConnectTimeout only covers the TCP
+# connect, and a half-up server that accepts and hangs would stall forever.
+# Parameters: $1 = server address, $2 = boot_id captured before reboot (may be "")
 # Returns: 0 if reboot successful, 1 if timeout or error
 # Side effects: Updates status file, writes reboot_status file (success/failed)
 verify_reboot() {
     local server="$1"
+    local old_boot_id="${2:-}"
     local ssh_cmd
     ssh_cmd=$(get_ssh_cmd "$server")
 
@@ -1041,67 +1290,101 @@ verify_reboot() {
     local max_attempts=$((REBOOT_MAX_WAIT / REBOOT_WAIT_INTERVAL))
     local attempts=0
 
-    update_status "$server" "Rebooting... waiting for server to go down"
     echo "$(date) - Waiting for $server to reboot" >> "$LOG_FILE"
 
-    # ========================================
-    # Phase 1: Wait for server to go down
-    # ========================================
-    # We check every 5 seconds for up to 100 seconds (20 attempts)
-    # This ensures the reboot command was actually executed
-    local down_attempts=0
-    local max_down_attempts=20  # 20 attempts × 5 seconds = 100 seconds max
+    if [[ -z "$ssh_cmd" ]]; then
+        # Local machine: we can't probe ourselves over SSH. (Phase 3 skips
+        # local aliases and Phase 4 reboots inline, so this is only a safety
+        # net.) Give the reboot time to start.
+        sleep 30
+    elif [[ -z "$old_boot_id" ]]; then
+        # ========================================
+        # Fallback Phase 1: Wait for server to go down
+        # ========================================
+        # Without a boot_id we can only infer a reboot by watching the server
+        # disappear. Check every 5 seconds for up to 100 seconds (20 attempts).
+        update_status "$server" "Rebooting... waiting for server to go down"
+        local down_attempts=0
+        local max_down_attempts=20  # 20 attempts x 5 seconds = 100 seconds max
 
-    if [[ -n "$ssh_cmd" ]]; then
-        # Remote server: use SSH to check if it's still responding
-        while $ssh_cmd "$server" "echo 'up'" &>/dev/null && [[ $down_attempts -lt $max_down_attempts ]]; do
+        # shellcheck disable=SC2086
+        while timeout 15s $ssh_cmd "$server" "echo 'up'" &>/dev/null && [[ $down_attempts -lt $max_down_attempts ]]; do
             sleep 5  # Check every 5 seconds
             ((down_attempts++))
         done
-    else
-        # Localhost: We can't SSH to check status
-        # Wait 30 seconds and assume the reboot is in progress
-        sleep 30
-    fi
 
-    # If server didn't go down after 100 seconds, the reboot command may have failed
-    if [[ -n "$ssh_cmd" && $down_attempts -ge $max_down_attempts ]]; then
-        update_status "$server" "ERROR: Server did not go down after reboot command"
-        echo "$(date) - ERROR: $server did not go down after reboot command" >> "$LOG_FILE"
-        safe_write_file "$TEMP_DIR/${server}.reboot_status" "failed"
-        return 1
+        # If server didn't go down after 100 seconds, the reboot command may have failed
+        if [[ $down_attempts -ge $max_down_attempts ]]; then
+            update_status "$server" "ERROR: Server did not go down after reboot command"
+            echo "$(date) - ERROR: $server did not go down after reboot command" >> "$LOG_FILE"
+            safe_write_file "$TEMP_DIR/${server}.reboot_status" "failed"
+            return 1
+        fi
     fi
 
     # ========================================
-    # Phase 2: Wait for server to come back up
+    # Wait for server to come back up
     # ========================================
-    update_status "$server" "Rebooting... checking every ${REBOOT_WAIT_INTERVAL}s for reconnection"
+    update_status "$server" "Rebooting... checking every ${REBOOT_WAIT_INTERVAL}s"
+
+    # In boot_id mode, track whether the server was ever unreachable so a
+    # reboot command that silently failed (boot_id never changes, host never
+    # drops) is reported as "did not go down" instead of waiting out the
+    # full REBOOT_MAX_WAIT.
+    local went_unreachable=false
 
     while [[ $attempts -lt $max_attempts ]]; do
         sleep "$REBOOT_WAIT_INTERVAL"
         ((attempts++))
 
-        # Try to connect and verify server is fully responsive
-        # We use 'uptime' command as a simple test that requires server to be fully booted
-        local responsive=false
-        if [[ -n "$ssh_cmd" ]]; then
-            # Remote server: Try SSH connection
-            if $ssh_cmd "$server" "uptime" &>/dev/null; then
-                responsive=true
+        if [[ -n "$ssh_cmd" && -n "$old_boot_id" ]]; then
+            # boot_id mode: a reachable host with a NEW boot_id has provably
+            # rebooted; a reachable host with the SAME boot_id hasn't gone
+            # down yet, so keep waiting.
+            local new_boot_id
+            # shellcheck disable=SC2086
+            new_boot_id=$(timeout 20s $ssh_cmd "$server" "cat /proc/sys/kernel/random/boot_id" 2>/dev/null)
+            if [[ -n "$new_boot_id" ]]; then
+                if [[ "$new_boot_id" != "$old_boot_id" ]]; then
+                    update_status "$server" "${GLYPH_OK} Reboot complete"
+                    echo "$(date) - $server successfully rebooted after $((attempts * REBOOT_WAIT_INTERVAL)) seconds" >> "$LOG_FILE"
+                    safe_write_file "$TEMP_DIR/${server}.reboot_status" "success"
+                    return 0
+                fi
+                # Same boot_id and never seen down after ~2 minutes: the
+                # reboot command almost certainly never took effect.
+                if [[ "$went_unreachable" == false && $((attempts * REBOOT_WAIT_INTERVAL)) -ge 120 ]]; then
+                    update_status "$server" "ERROR: Server did not go down after reboot command"
+                    echo "$(date) - ERROR: $server never rebooted (boot_id unchanged after $((attempts * REBOOT_WAIT_INTERVAL))s)" >> "$LOG_FILE"
+                    safe_write_file "$TEMP_DIR/${server}.reboot_status" "failed"
+                    return 1
+                fi
+                update_status "$server" "Rebooting... not down yet ($attempts/$max_attempts)"
+                continue
             fi
+            went_unreachable=true
         else
-            # Localhost: Check if uptime command works
-            if uptime &>/dev/null; then
-                responsive=true
+            # Fallback mode: 'uptime' succeeding means the server is back up
+            local responsive=false
+            if [[ -n "$ssh_cmd" ]]; then
+                # shellcheck disable=SC2086
+                if timeout 20s $ssh_cmd "$server" "uptime" &>/dev/null; then
+                    responsive=true
+                fi
+            else
+                # Localhost: Check if uptime command works
+                if uptime &>/dev/null; then
+                    responsive=true
+                fi
             fi
-        fi
 
-        if [[ "$responsive" == true ]]; then
-            # Server is back online and responsive!
-            update_status "$server" "✓ Reboot complete"
-            echo "$(date) - $server successfully rebooted after $((attempts * REBOOT_WAIT_INTERVAL)) seconds" >> "$LOG_FILE"
-            safe_write_file "$TEMP_DIR/${server}.reboot_status" "success"
-            return 0
+            if [[ "$responsive" == true ]]; then
+                # Server is back online and responsive!
+                update_status "$server" "${GLYPH_OK} Reboot complete"
+                echo "$(date) - $server successfully rebooted after $((attempts * REBOOT_WAIT_INTERVAL)) seconds" >> "$LOG_FILE"
+                safe_write_file "$TEMP_DIR/${server}.reboot_status" "success"
+                return 0
+            fi
         fi
 
         # Update dashboard with current attempt number
@@ -1142,8 +1425,13 @@ apply_updates() {
     local update_cmd
     case "$pkg_manager" in
         apt)
-            # For apt: Use DEBIAN_FRONTEND=noninteractive to avoid prompts
-            update_cmd="sudo DEBIAN_FRONTEND=noninteractive apt-get upgrade -y"
+            # dist-upgrade, NOT upgrade: new kernels arrive as NEW versioned
+            # packages (linux-image-X.Y.Z-generic), which plain upgrade holds
+            # back -- kernels were flagged in review but never installed.
+            # force-confdef/confold keep dpkg from stalling on conffile
+            # prompts, which DEBIAN_FRONTEND=noninteractive alone doesn't fully
+            # suppress. Both flags work on every apt back to Debian oldstable.
+            update_cmd="sudo DEBIAN_FRONTEND=noninteractive apt-get -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold dist-upgrade -y"
             ;;
         dnf)
             update_cmd="sudo dnf update -y"
@@ -1158,9 +1446,11 @@ apply_updates() {
             ;;
     esac
 
-    # Run update command
+    # Run update command with the apply-phase timeout (larger than the check
+    # phase's DNF_TIMEOUT: killing a transaction mid-flight risks rpmdb/dpkg
+    # corruption, so err on the side of patience)
     local update_output
-    update_output=$(execute_remote_command "$server" "$update_cmd")
+    update_output=$(execute_remote_command "$server" "$update_cmd" "$APPLY_TIMEOUT")
     local update_exit_code=$?
 
     # Check for sudo error on localhost
@@ -1170,10 +1460,12 @@ apply_updates() {
         return 1
     fi
 
-    # Check for timeout
+    # Check for timeout. Note: the timeout kills the local ssh, NOT the remote
+    # package manager -- it may well still be running on the server.
     if [[ $update_exit_code -eq 124 ]]; then
-        update_status "$server" "ERROR: Update command timed out"
-        echo "$(date) - ERROR: Update timed out on $server" >> "$LOG_FILE"
+        update_status "$server" "ERROR: Update timed out (may still be running)"
+        echo "$(date) - ERROR: Update timed out on $server after ${APPLY_TIMEOUT}s." >> "$LOG_FILE"
+        echo "$(date) - WARNING: The package manager on $server may STILL BE RUNNING. Verify it finished before re-running this script." >> "$LOG_FILE"
         echo "$update_output" >> "$LOG_FILE"
         return 1
     elif [[ $update_exit_code -ne 0 ]]; then
@@ -1189,8 +1481,15 @@ apply_updates() {
 
     case "$pkg_manager" in
         apt)
-            # For apt, look for linux-image, linux-headers, or linux-modules packages
-            if echo "$update_output" | grep -qiE "(linux-image|linux-headers|linux-modules)"; then
+            # Match packages actually installed ("Unpacking"/"Setting up"
+            # lines), NOT any mention of linux-image -- the old unanchored grep
+            # also matched the "kept back" list and rebooted servers where no
+            # kernel was installed at all. /var/run/reboot-required is the
+            # distro's own signal and also catches non-kernel reboot needs
+            # (libc, systemd).
+            if echo "$update_output" | grep -qiE "^(Setting up|Unpacking) linux-(image|headers|modules)"; then
+                kernel_updated=true
+            elif [[ "$(execute_remote_command "$server" "test -f /var/run/reboot-required && echo yes" 15)" == *yes* ]]; then
                 kernel_updated=true
             fi
             ;;
@@ -1207,6 +1506,14 @@ apply_updates() {
         echo "$(date) - Kernel updated on $server - initiating reboot" >> "$LOG_FILE"
         safe_write_file "$TEMP_DIR/${server}.update_type" "kernel_update"
 
+        # Capture the pre-reboot boot_id so verify_reboot can prove a reboot
+        # happened even if the host cycles faster than the polling interval.
+        # The grep keeps only a well-formed UUID line (ssh warnings and sudo
+        # noise share the merged output stream); empty means "unavailable"
+        # and verify_reboot falls back to down/up polling.
+        local old_boot_id
+        old_boot_id=$(execute_remote_command "$server" "cat /proc/sys/kernel/random/boot_id" 15 | grep -E '^[0-9a-f-]{36}$' | tail -1)
+
         # Wait 2 seconds before rebooting to ensure everything is flushed
         sleep 2
 
@@ -1219,10 +1526,10 @@ apply_updates() {
         fi
 
         # Monitor the reboot process and wait for server to come back
-        verify_reboot "$server"
+        verify_reboot "$server" "$old_boot_id"
     else
         # No kernel update - mark as complete without reboot
-        update_status "$server" "✓ Complete - No reboot needed"
+        update_status "$server" "${GLYPH_OK} Complete - No reboot needed"
         echo "$(date) - Updates completed on $server (no kernel update)" >> "$LOG_FILE"
         safe_write_file "$TEMP_DIR/${server}.update_type" "no_reboot"
     fi
@@ -1241,7 +1548,7 @@ echo ""
 echo -e "${BOLD}Servers to check (${#SERVERS[@]} total):${NC}"
 for server in "${SERVERS[@]}"; do
     display_name=$(get_display_name "$server")
-    echo "  • $display_name"
+    echo "  ${GLYPH_BULLET} $display_name"
 done
 echo ""
 
@@ -1250,8 +1557,9 @@ echo ""
 # accept-new / ControlPath %C).
 detect_ssh_capabilities
 
-# Skip interactive prompt in automated modes
-if [[ "$NON_INTERACTIVE" == true || "$CHECK_ONLY" == true || "$ASSUME_YES" == true ]]; then
+# Skip interactive prompt in automated modes (--dry-run included: it is
+# routinely run from cron/CI where nobody can press Enter)
+if [[ "$NON_INTERACTIVE" == true || "$CHECK_ONLY" == true || "$ASSUME_YES" == true || "$DRY_RUN" == true ]]; then
     echo -e "${CYAN}Starting update check (automated mode)...${NC}"
 else
     echo -e "${CYAN}Press Enter to start checking for updates...${NC}"
@@ -1276,17 +1584,24 @@ for server in "${SERVERS[@]}"; do
     check_server_updates "$server" &
 done
 
-# Wait for all background checks to complete with live dashboard updates
-while [[ $(jobs -r | wc -l) -gt 0 ]]; do
-    draw_dashboard
-    sleep "$DASHBOARD_REFRESH"
-done
+# Wait for all background checks to complete with live dashboard updates.
+# The live loop only runs on a terminal; in cron/pipes we just wait and print
+# one final table (no escape codes sprayed into logs).
+DASH_START=$SECONDS
+if [[ "$IS_TTY" == true ]]; then
+    printf '\033[?25l\033[2J'  # hide cursor, clear once; frames repaint in place
+    while [[ $(jobs -r | wc -l) -gt 0 ]]; do
+        draw_dashboard
+        sleep "$DASHBOARD_REFRESH"
+    done
+fi
 
 # Ensure all background jobs are truly finished (Fix: Issue #30)
 wait
 
 # Display final dashboard state
 draw_dashboard
+[[ "$IS_TTY" == true ]] && printf '\033[?25h'  # restore cursor
 
 echo -e "${BOLD}${GREEN}Update check complete!${NC}\n"
 sleep 2
@@ -1304,9 +1619,13 @@ sleep 2
 #   --check-only: Display updates but don't prompt
 #   --assume-yes: Auto-approve all updates
 # ============================================================================
+# Interactive review state: 'a' approves everything remaining, 'q' stops the review
+APPROVE_ALL=false
+REVIEW_QUIT=false
+
 for server in "${SERVERS[@]}"; do
-    # Skip localhost - it will be handled separately in Phase 4
-    if [[ "$server" == "localhost" ]]; then
+    # Skip local aliases (localhost/127.0.0.1/::1) - handled separately in Phase 4
+    if is_localhost "$server"; then
         continue
     fi
 
@@ -1318,15 +1637,19 @@ for server in "${SERVERS[@]}"; do
         continue
     fi
 
-    status=$(safe_read_file "$status_file" "Unknown")
+    safe_read_file "$status_file" "Unknown"
+    status="$SRF_RESULT"
 
     # Skip servers with errors or no updates
     if [[ "$status" == *"ERROR"* ]] || [[ "$status" == *"No updates"* ]]; then
         continue
     fi
 
-    # Verify updates are actually available
-    if ! grep -q "Transaction Summary" "$output_file"; then
+    # Verify updates are actually available. dnf/yum previews contain
+    # "Transaction Summary"; apt output starts with "Listing..." -- this gate
+    # previously only knew the dnf format, which silently dropped every apt
+    # server from review (they could never be approved or updated).
+    if ! grep -q -e "Transaction Summary" -e "^Listing" "$output_file"; then
         continue
     fi
 
@@ -1357,17 +1680,14 @@ for server in "${SERVERS[@]}"; do
             echo ""
             ;;
         dnf|yum)
-            # Show packages being upgraded
-            sed -n '/^Upgrading:/,/^Transaction Summary/p' "$output_file" | head -n -1 | while read -r line; do
-                if has_kernel_package "$line" "$pkg_manager"; then
-                    echo -e "${RED}${BOLD}$line${NC}"
-                else
-                    echo "$line"
-                fi
-            done
-
-            # Show packages being installed (new packages)
-            sed -n '/^Installing:/,/^Transaction Summary/p' "$output_file" | head -n -1 | while read -r line; do
+            # One pass over the whole package table: from the first section
+            # header to the Transaction Summary. The header alternation matters
+            # for old distros -- dnf says "Upgrading:" but yum (CentOS 6/7) says
+            # "Updating:", so the old Upgrading-only range showed an EMPTY
+            # package list on yum hosts. A single range also avoids the
+            # duplicated output the old per-section ranges produced when both
+            # Installing: and Upgrading: sections were present.
+            sed -n '/^\(Installing\|Upgrading\|Updating\|Removing\|Downgrading\|Reinstalling\)[^:]*:[[:space:]]*$/,/^Transaction Summary/p' "$output_file" | head -n -1 | while read -r line; do
                 if has_kernel_package "$line" "$pkg_manager"; then
                     echo -e "${RED}${BOLD}$line${NC}"
                 else
@@ -1385,7 +1705,7 @@ for server in "${SERVERS[@]}"; do
     # Warn if kernel update detected
     output_content=$(cat "$output_file")
     if has_kernel_package "$output_content" "$pkg_manager"; then
-        echo -e "${YELLOW}${BOLD}⚠ Kernel update detected - server will be rebooted after updates${NC}"
+        echo -e "${YELLOW}${BOLD}${GLYPH_WARN} Kernel update detected - server will be rebooted after updates${NC}"
         echo ""
     fi
 
@@ -1401,21 +1721,41 @@ for server in "${SERVERS[@]}"; do
     elif [[ "$ASSUME_YES" == true ]]; then
         echo -e "${GREEN}Auto-approving updates (--assume-yes mode)${NC}\n"
         echo "$server" >> "$TEMP_DIR/approved_servers.txt"
+    elif [[ "$APPROVE_ALL" == true ]]; then
+        echo -e "${GREEN}Auto-approving updates ('a' selected earlier)${NC}\n"
+        echo "$server" >> "$TEMP_DIR/approved_servers.txt"
     else
         # Interactive mode - prompt user
-        echo -e -n "${BOLD}Apply updates to $display_name? [y/N]: ${NC}"
+        echo -e -n "${BOLD}Apply updates to $display_name? [y/N/a=yes to all/q=quit review]: ${NC}"
         read -r response
 
-        if [[ "$response" =~ ^[Yy]$ ]]; then
-            echo -e "${GREEN}Proceeding with updates for $display_name...${NC}\n"
-            echo "$server" >> "$TEMP_DIR/approved_servers.txt"
-        else
-            echo -e "${YELLOW}Skipping updates for $display_name${NC}\n"
-            update_status "$server" "Skipped by user"
-        fi
+        case "$response" in
+            [Yy])
+                echo -e "${GREEN}Proceeding with updates for $display_name...${NC}\n"
+                echo "$server" >> "$TEMP_DIR/approved_servers.txt"
+                ;;
+            [Aa])
+                APPROVE_ALL=true
+                echo -e "${GREEN}Proceeding with updates for $display_name (and all remaining servers)...${NC}\n"
+                echo "$server" >> "$TEMP_DIR/approved_servers.txt"
+                ;;
+            [Qq])
+                echo -e "${YELLOW}Quitting review - skipping this and all remaining servers${NC}\n"
+                update_status "$server" "Skipped by user"
+                REVIEW_QUIT=true
+                ;;
+            *)
+                echo -e "${YELLOW}Skipping updates for $display_name${NC}\n"
+                update_status "$server" "Skipped by user"
+                ;;
+        esac
     fi
 
     echo ""
+
+    if [[ "$REVIEW_QUIT" == true ]]; then
+        break
+    fi
 done
 
 # ============================================================================
@@ -1433,26 +1773,31 @@ if [[ -f "$TEMP_DIR/approved_servers.txt" ]]; then
     sleep 2
 
     # Launch update process for each approved server in the background
-    # Skip localhost - it will be handled in Phase 4 after all remote servers complete
+    # Skip local aliases - handled in Phase 4 after all remote servers complete
     while IFS= read -r server; do
-        # Skip localhost
-        if [[ "$server" == "localhost" ]]; then
+        if is_localhost "$server"; then
             continue
         fi
         apply_updates "$server" &
     done < "$TEMP_DIR/approved_servers.txt"
 
     # Wait for all update processes to complete with live dashboard
-    while [[ $(jobs -r | wc -l) -gt 0 ]]; do
-        draw_dashboard
-        sleep "$DASHBOARD_REFRESH"
-    done
+    # (terminal only; see Phase 1 loop for rationale)
+    DASH_START=$SECONDS
+    if [[ "$IS_TTY" == true ]]; then
+        printf '\033[?25l\033[2J'  # hide cursor, clear once; frames repaint in place
+        while [[ $(jobs -r | wc -l) -gt 0 ]]; do
+            draw_dashboard
+            sleep "$DASHBOARD_REFRESH"
+        done
+    fi
 
     # Ensure all background jobs are truly finished (Fix: Issue #30)
     wait
 
     # Display final dashboard state
     draw_dashboard
+    [[ "$IS_TTY" == true ]] && printf '\033[?25h'  # restore cursor
 
     # ========================================================================
     # PHASE 3.5: Display comprehensive results summary
@@ -1475,8 +1820,8 @@ if [[ -f "$TEMP_DIR/approved_servers.txt" ]]; then
 
     # Process each approved server and display results
     while IFS= read -r server; do
-        # Skip localhost - it will be handled in Phase 4
-        if [[ "$server" == "localhost" ]]; then
+        # Skip local aliases - handled in Phase 4
+        if is_localhost "$server"; then
             continue
         fi
 
@@ -1486,29 +1831,32 @@ if [[ -f "$TEMP_DIR/approved_servers.txt" ]]; then
         result_color="${GREEN}"
 
         # Determine what type of update was performed (kernel or regular)
-        update_type=$(safe_read_file "$TEMP_DIR/${server}.update_type" "")
+        safe_read_file "$TEMP_DIR/${server}.update_type" ""
+        update_type="$SRF_RESULT"
 
         # For kernel updates, check if reboot was successful
         if [[ "$update_type" == "kernel_update" ]]; then
-            reboot_status=$(safe_read_file "$TEMP_DIR/${server}.reboot_status" "")
+            safe_read_file "$TEMP_DIR/${server}.reboot_status" ""
+            reboot_status="$SRF_RESULT"
             if [[ "$reboot_status" == "success" ]]; then
-                result_msg="✓ Updated and reboot complete"
+                result_msg="${GLYPH_OK} Updated and reboot complete"
                 result_color="${GREEN}"
                 ((servers_rebooted++))
             else
-                result_msg="✗ Updated but failed to verify reboot"
+                result_msg="${GLYPH_FAIL} Updated but failed to verify reboot"
                 result_color="${RED}"
                 ((servers_failed++))
             fi
         elif [[ "$update_type" == "no_reboot" ]]; then
-            result_msg="✓ Successfully updated (no reboot required)"
+            result_msg="${GLYPH_OK} Successfully updated (no reboot required)"
             result_color="${GREEN}"
             ((servers_updated++))
         else
             # No update type recorded - check status for error messages
-            current_status=$(safe_read_file "$TEMP_DIR/${server}.status" "Unknown")
+            safe_read_file "$TEMP_DIR/${server}.status" "Unknown"
+            current_status="$SRF_RESULT"
             if [[ "$current_status" == *"ERROR"* ]]; then
-                result_msg="✗ Update failed"
+                result_msg="${GLYPH_FAIL} Update failed"
                 result_color="${RED}"
                 ((servers_failed++))
             else
@@ -1543,17 +1891,22 @@ fi
 # confirming all remote servers are healthy
 # ============================================================================
 
-# Check if localhost is in the server list and has updates available
+# Check if the local machine is in the server list and has updates available.
+# It may be listed as localhost, 127.0.0.1, or ::1 -- state files are keyed by
+# whatever name was used in the server list.
+LOCAL_SERVER=""
 localhost_has_updates=false
 for server in "${SERVERS[@]}"; do
-    if [[ "$server" == "localhost" ]]; then
+    if is_localhost "$server"; then
+        LOCAL_SERVER="$server"
         # Check if localhost has updates (check the output file exists and has content)
-        if [[ -f "$TEMP_DIR/localhost.output" ]]; then
-            status=$(safe_read_file "$TEMP_DIR/localhost.status" "")
+        if [[ -f "$TEMP_DIR/${LOCAL_SERVER}.output" ]]; then
+            safe_read_file "$TEMP_DIR/${LOCAL_SERVER}.status" ""
+            status="$SRF_RESULT"
             # Only prompt if localhost has updates (not errors or "No updates")
             if [[ "$status" != *"ERROR"* && "$status" != *"No updates"* ]]; then
                 # Verify updates are actually available (check for package manager output)
-                if grep -q "Transaction Summary\|Listing..." "$TEMP_DIR/localhost.output" 2>/dev/null; then
+                if grep -q -e "Transaction Summary" -e "^Listing" "$TEMP_DIR/${LOCAL_SERVER}.output" 2>/dev/null; then
                     localhost_has_updates=true
                 fi
             fi
@@ -1561,6 +1914,19 @@ for server in "${SERVERS[@]}"; do
         break
     fi
 done
+
+# --dry-run and --check-only promise no changes; never touch the local server
+# in those modes (previously Phase 4 ignored both flags and could apply
+# updates and even reboot the local machine)
+if [[ "$localhost_has_updates" == "true" && ( "$DRY_RUN" == true || "$CHECK_ONLY" == true ) ]]; then
+    echo ""
+    if [[ "$DRY_RUN" == true ]]; then
+        echo -e "${CYAN}Local server has updates pending - skipped (--dry-run mode)${NC}"
+    else
+        echo -e "${CYAN}Local server has updates pending - skipped (--check-only mode)${NC}"
+    fi
+    localhost_has_updates=false
+fi
 
 if [[ "$localhost_has_updates" == "true" ]]; then
     echo ""
@@ -1573,52 +1939,53 @@ if [[ "$localhost_has_updates" == "true" ]]; then
     echo ""
 
     # Get package manager for localhost (read from cache set in Phase 1)
-    pkg_manager=$(get_pkg_manager "localhost")
+    pkg_manager=$(get_pkg_manager "$LOCAL_SERVER")
     if [[ -z "$pkg_manager" || "$pkg_manager" == "unknown" ]]; then
         # Fallback: detect it now if cache doesn't exist
-        pkg_manager=$(detect_package_manager "localhost")
+        pkg_manager=$(detect_package_manager "$LOCAL_SERVER")
     fi
 
     # Show what updates are pending
-    if [[ -f "$TEMP_DIR/localhost.output" ]]; then
+    if [[ -f "$TEMP_DIR/${LOCAL_SERVER}.output" ]]; then
         echo -e "${BOLD}Updates available for local server:${NC}"
         echo ""
 
         case "$pkg_manager" in
             apt)
-                filter_apt_header "$TEMP_DIR/localhost.output" | head -20
+                filter_apt_header "$TEMP_DIR/${LOCAL_SERVER}.output" | head -20
                 ;;
             dnf|yum)
-                sed -n '/^Upgrading:/,/^Transaction Summary/p' "$TEMP_DIR/localhost.output" | head -20
-                sed -n '/^Installing:/,/^Transaction Summary/p' "$TEMP_DIR/localhost.output" | head -20
-                sed -n '/^Transaction Summary/,/^Total download size/p' "$TEMP_DIR/localhost.output"
+                # Same header alternation as Phase 2: dnf says "Upgrading:",
+                # yum (CentOS 6/7) says "Updating:"
+                sed -n '/^\(Installing\|Upgrading\|Updating\|Removing\|Downgrading\|Reinstalling\)[^:]*:[[:space:]]*$/,/^Transaction Summary/p' "$TEMP_DIR/${LOCAL_SERVER}.output" | head -n -1 | head -20
+                sed -n '/^Transaction Summary/,/^Total download size/p' "$TEMP_DIR/${LOCAL_SERVER}.output"
                 ;;
         esac
 
         echo ""
 
         # Check if kernel update is included
-        output_content=$(cat "$TEMP_DIR/localhost.output")
+        output_content=$(cat "$TEMP_DIR/${LOCAL_SERVER}.output")
         if has_kernel_package "$output_content" "$pkg_manager"; then
-            echo -e "${RED}${BOLD}⚠️  WARNING: Kernel update detected!${NC}"
-            echo -e "${RED}${BOLD}⚠️  The local server will REBOOT after updates complete.${NC}"
-            echo -e "${RED}${BOLD}⚠️  You will lose your session if running this script locally.${NC}"
+            echo -e "${RED}${BOLD}${GLYPH_WARN}  WARNING: Kernel update detected!${NC}"
+            echo -e "${RED}${BOLD}${GLYPH_WARN}  The local server will REBOOT after updates complete.${NC}"
+            echo -e "${RED}${BOLD}${GLYPH_WARN}  You will lose your session if running this script locally.${NC}"
             echo ""
         fi
     fi
 
-    # Prompt for confirmation (or auto-approve in non-interactive mode with assume-yes)
+    # Prompt for confirmation. --assume-yes alone auto-approves, matching the
+    # Phase 2 behavior (it previously also required --non-interactive here,
+    # which made the two phases inconsistent).
     proceed=false
-    if [[ "$NON_INTERACTIVE" == true ]]; then
-        if [[ "$ASSUME_YES" == true ]]; then
-            echo -e "${GREEN}Auto-approving local server update (--non-interactive --assume-yes mode)${NC}"
-            echo ""
-            proceed=true
-        else
-            echo -e "${YELLOW}Skipping local server update (--non-interactive mode without --assume-yes)${NC}"
-            echo ""
-            proceed=false
-        fi
+    if [[ "$ASSUME_YES" == true ]]; then
+        echo -e "${GREEN}Auto-approving local server update (--assume-yes mode)${NC}"
+        echo ""
+        proceed=true
+    elif [[ "$NON_INTERACTIVE" == true ]]; then
+        echo -e "${YELLOW}Skipping local server update (--non-interactive mode without --assume-yes)${NC}"
+        echo ""
+        proceed=false
     else
         echo -e "${BOLD}${YELLOW}=====================================================================${NC}"
         echo -e -n "${BOLD}${YELLOW}Proceed with local server update? [y/N]: ${NC}"
@@ -1633,19 +2000,20 @@ if [[ "$localhost_has_updates" == "true" ]]; then
         echo -e "${GREEN}Updating local server...${NC}"
         echo ""
 
-        # Determine update command based on package manager
+        # Determine update command based on package manager (same commands as
+        # the remote Phase 3 path -- see apply_updates for the rationale on
+        # dist-upgrade and the dpkg conffile options)
         update_cmd=""
         case "$pkg_manager" in
             apt)
-                update_cmd="sudo DEBIAN_FRONTEND=noninteractive apt-get upgrade -y"
+                update_cmd="sudo DEBIAN_FRONTEND=noninteractive apt-get -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold dist-upgrade -y"
                 ;;
             dnf)
-                # Use --assumeyes to ensure no prompts, and -y for compatibility
-                update_cmd="sudo dnf update -y --assumeyes"
+                update_cmd="sudo dnf update -y"
                 ;;
             yum)
-                # Use --assumeyes to ensure no prompts, and -y for compatibility
-                update_cmd="sudo yum update -y --assumeyes"
+                # Plain -y only: --assumeyes is not understood by RHEL 6's yum
+                update_cmd="sudo yum update -y"
                 ;;
             *)
                 echo -e "${RED}[ERROR]${NC} Unknown package manager on local server"
@@ -1662,26 +2030,30 @@ if [[ "$localhost_has_updates" == "true" ]]; then
 
         # Run update, showing output in real-time and also capturing to file.
         # LC_ALL=C keeps output English-parseable (matches execute_remote_command).
-        timeout "${DNF_TIMEOUT}s" bash -c "export LC_ALL=C; $update_cmd" 2>&1 | tee "$update_output_file"
+        timeout "${APPLY_TIMEOUT}s" bash -c "export LC_ALL=C; $update_cmd" 2>&1 | tee "$update_output_file"
         update_exit_code=${PIPESTATUS[0]}
 
         if [[ $update_exit_code -eq 124 ]]; then
-            echo -e "${RED}[ERROR]${NC} Update command timed out"
+            echo -e "${RED}[ERROR]${NC} Update command timed out after ${APPLY_TIMEOUT}s"
             echo "$(date) - ERROR: Local server update timed out" >> "$LOG_FILE"
         elif [[ $update_exit_code -ne 0 ]]; then
             echo -e "${RED}[ERROR]${NC} Update failed"
             echo "$(date) - ERROR: Local server update failed" >> "$LOG_FILE"
         else
             echo ""
-            echo -e "${GREEN}✓ Local server updates completed successfully!${NC}"
+            echo -e "${GREEN}${GLYPH_OK} Local server updates completed successfully!${NC}"
             echo "$(date) - Local server updated successfully" >> "$LOG_FILE"
 
-            # Check if kernel was updated (read from captured output file)
+            # Check if kernel was updated (read from captured output file).
+            # Same detection as apply_updates: match installed packages, not the
+            # apt "kept back" list, plus the distro's own reboot-required flag.
             kernel_updated=false
             if [[ -f "$update_output_file" ]]; then
                 case "$pkg_manager" in
                     apt)
-                        if grep -qiE "(linux-image|linux-headers|linux-modules)" "$update_output_file"; then
+                        if grep -qiE "^(Setting up|Unpacking) linux-(image|headers|modules)" "$update_output_file"; then
+                            kernel_updated=true
+                        elif [[ -f /var/run/reboot-required ]]; then
                             kernel_updated=true
                         fi
                         ;;
@@ -1696,21 +2068,19 @@ if [[ "$localhost_has_updates" == "true" ]]; then
             if [[ "$kernel_updated" == "true" ]]; then
                 echo ""
                 echo -e "${YELLOW}${BOLD}=====================================================================${NC}"
-                echo -e "${YELLOW}${BOLD}⚠️  KERNEL UPDATE DETECTED - REBOOT REQUIRED${NC}"
+                echo -e "${YELLOW}${BOLD}${GLYPH_WARN}  KERNEL UPDATE DETECTED - REBOOT REQUIRED${NC}"
                 echo -e "${YELLOW}${BOLD}=====================================================================${NC}"
                 echo ""
                 echo -e "${YELLOW}The local server kernel has been updated and requires a reboot.${NC}"
                 do_reboot=false
-                if [[ "$NON_INTERACTIVE" == true ]]; then
-                    if [[ "$ASSUME_YES" == true ]]; then
-                        echo ""
-                        echo -e "${GREEN}Auto-approving reboot (--non-interactive --assume-yes mode)${NC}"
-                        do_reboot=true
-                    else
-                        echo ""
-                        echo -e "${YELLOW}Skipping reboot (--non-interactive mode without --assume-yes)${NC}"
-                        do_reboot=false
-                    fi
+                if [[ "$ASSUME_YES" == true ]]; then
+                    echo ""
+                    echo -e "${GREEN}Auto-approving reboot (--assume-yes mode)${NC}"
+                    do_reboot=true
+                elif [[ "$NON_INTERACTIVE" == true ]]; then
+                    echo ""
+                    echo -e "${YELLOW}Skipping reboot (--non-interactive mode without --assume-yes)${NC}"
+                    do_reboot=false
                 else
                     echo ""
                     echo -e -n "${BOLD}${RED}Reboot local server now? [y/N]: ${NC}"

@@ -16,12 +16,16 @@ This is a bash-based server update management tool for managing package updates 
 
 ## Supported Distributions
 
-- **Debian/Ubuntu** (apt-based): Uses `apt-get update && apt list --upgradable`
+- **Debian/Ubuntu** (apt-based): Checks with `apt-get update && apt list --upgradable`, applies with `apt-get dist-upgrade` (NOT plain `upgrade` — new kernels arrive as new versioned packages that `upgrade` holds back)
 - **RHEL/CentOS/Rocky/Alma** (dnf-based): Uses `dnf update --assumeno`
-- **CentOS 7/RHEL 7** (yum-based): Falls back to `yum update --assumeno`
+- **CentOS 6/7, RHEL 6/7** (yum-based): Checks with `echo n | yum update` — NOT `--assumeno`, which needs yum 3.4.3 (RHEL 7) and dies with "no such option" on RHEL 6's yum 3.2.29. Piping "n" produces the same transaction preview on every yum version
 - **Fedora** (dnf-based): Uses `dnf update --assumeno`
 
-Package manager is auto-detected on each server during Phase 1.
+Package manager is auto-detected on each server during Phase 1. yum output
+parsing is generation-aware: yum says `Updating:` where dnf says `Upgrading:`,
+and RHEL 6's Transaction Summary says `Update N Package(s)` where newer tools
+say `Upgrade` — both the Phase 2 display sed range and
+`parse_dnf_package_count()` accept all variants.
 
 ## Key Architecture
 
@@ -29,12 +33,22 @@ Package manager is auto-detected on each server during Phase 1.
 
 ```bash
 declare -a SERVERS                    # Array of server addresses
-declare -A SERVER_NICKNAMES           # server -> nickname mapping
-declare -A SERVER_PORTS               # server -> SSH port mapping
-declare -A SERVER_PKG_MANAGER         # server -> package manager (apt/dnf/yum)
-declare -A SERVER_OS_RELEASE          # server -> OS release string
-declare -A SERVER_KERNEL              # server -> kernel version
+declare -A SERVER_NICKNAMES          # server -> nickname mapping
+declare -A SERVER_PORTS              # server -> SSH port mapping
+declare -A PKG_MANAGER_CACHE         # server -> pkg manager (lazy cache over ${server}.pkg_manager file)
+declare -A DISPLAY_NAME_CACHE        # server -> "server (nickname)" display string
 ```
+
+Per-server OS release, kernel, and package manager live in **temp files**, not
+associative arrays — background jobs cannot modify parent-process variables
+(see State Management). Duplicate server addresses are rejected at parse time
+(the keyed arrays would silently merge them and the host would be updated
+twice in parallel).
+
+Local aliases: `is_localhost()` treats `localhost`, `127.0.0.1`, and `::1` as
+this machine. Every phase-skip check uses it — a `127.0.0.1` entry previously
+slipped past the literal `"localhost"` comparisons and could reboot the
+control host in Phase 3.
 
 ### Instance Locking
 
@@ -42,19 +56,23 @@ To prevent multiple instances from running simultaneously (which could cause pac
 
 **Lock File:** `/tmp/server_update.lock`
 
-**Startup Checks (lines 115-139):**
-- If lock file exists:
-  - Reads PID from lock file
+**Startup Checks (`acquire_lock()`):**
+- **Atomic acquisition**: `(set -o noclobber; echo "$$" > "$LOCK_FILE")` — the
+  redirection uses `O_CREAT|O_EXCL`, so two racing instances can't both win
+  (the old check-then-create had a window) and a pre-planted symlink at the
+  lock path is not followed
+- If acquisition fails:
+  - Reads PID from the existing lock file
   - Uses `kill -0 $PID` to check if process is still running
   - **Active instance**: Exits with error message showing PID
-  - **Stale lock**: Automatically removes and continues
-- Creates new lock file with current PID (`$$`)
-- Fails if unable to create lock file
+  - **Stale lock**: Removes it and retries the atomic acquire once
+- Fails with a permissions hint if the lock still can't be created
 
-**Lock Cleanup (line 310):**
+**Lock Cleanup (`cleanup()`, ~line 483):**
 - `cleanup()` function removes lock file on exit
 - Triggered by trap on EXIT, INT, TERM signals
 - Ensures clean removal even if script is interrupted
+- Also restores the terminal cursor (`\033[?25h`) if the live dashboard hid it
 
 **Error Handling:**
 - Clear error messages when another instance is detected
@@ -65,85 +83,113 @@ To prevent multiple instances from running simultaneously (which could cause pac
 
 The script operates in distinct phases:
 
-#### **Startup (lines ~980-998)**
+#### **Startup (lines ~1550-1568)**
 - Displays list of all servers to be checked
 - Shows total server count
 - Waits for user to press Enter to begin
-- **Exception**: In automated modes (`--non-interactive`, `--check-only`, `--assume-yes`), skips the Enter prompt
+- **Exception**: In automated modes (`--non-interactive`, `--check-only`, `--assume-yes`, `--dry-run`), skips the Enter prompt
 
-#### **Phase 1: Discovery & System Detection (lines ~860-884)**
+#### **Phase 1: Discovery & System Detection (lines ~1570-1608)**
 - Connects to all servers **in parallel** using background jobs
 - Each server runs in its own background process
 - For each server:
-  - Tests SSH connectivity
-  - Detects package manager: `detect_package_manager()` (lines 357-388)
-  - Gathers system info: `gather_system_info()`
+  - Discovers the server in **one SSH round-trip** via `probe_server_info()`,
+    which also serves as the connection test (its output always contains a
+    `PM=` sentinel; absence means the connection/remote shell failed). In a
+    single remote snippet it returns:
+    - Package manager (apt → dnf → yum order, same as `detect_package_manager()`)
     - OS release via fallback chain: `/etc/os-release` PRETTY_NAME →
       `lsb_release -d` → `/etc/redhat-release` (so pre-systemd hosts like
       CentOS/RHEL 6 still populate the OS column instead of showing `--`)
     - Kernel version from `uname -r`
+  - This replaced the old per-attribute sequence (separate connection test +
+    `detect_package_manager` + 2-4 `gather_system_info` calls), cutting Phase 1
+    discovery from ~5 round-trips per server (up to 7 on pre-systemd hosts) to 2
+    (the probe + the update check)
   - Runs appropriate update check command based on package manager
   - Counts available updates
 - Dashboard updates in real-time (configurable refresh rate)
 - Connection failures are displayed but don't stop execution
 
-#### **Phase 2: Review & Approval (lines ~886-1029)**
-- For each server with available updates:
+#### **Phase 2: Review & Approval (lines ~1610-1760)**
+- For each server with available updates (gate accepts BOTH formats: dnf/yum
+  "Transaction Summary" and apt "Listing..." — the gate previously only knew
+  the dnf format and silently dropped every apt server from review):
   - Displays server header with nickname
-  - Shows package list (format varies by package manager)
+  - Shows package list (format varies by package manager; dnf/yum uses one
+    sed range over all section headers — `Upgrading:`/`Updating:`/
+    `Installing:`/etc. — so yum hosts show their packages and nothing is
+    printed twice)
   - Highlights kernel packages in **RED BOLD** using `has_kernel_package()`
     - For apt: `linux-image`, `linux-headers`, `linux-modules`
     - For dnf/yum: Uses `KERNEL_PACKAGE_REGEX` config
   - Displays warning if kernel update detected
-  - Prompts for user confirmation unless:
+  - Prompts `[y/N/a=yes to all/q=quit review]`:
+    - `y`: approve this server
+    - `a`: approve this server and every remaining one without prompting
+    - `q`: skip this server and stop the review (remaining servers skipped)
+    - anything else: skip this server
+  - Prompting is bypassed entirely in:
     - `--dry-run`: Skip all updates
     - `--check-only`: Display only, don't prompt
     - `--assume-yes`: Auto-approve all
     - `--non-interactive`: Skips all interactive prompts
   - Approved servers written to `$TEMP_DIR/approved_servers.txt`
 
-#### **Phase 3: Parallel Execution (lines ~1031-1056)**
+#### **Phase 3: Parallel Execution (lines ~1762-1800)**
 - Reads approved servers list
 - Launches `apply_updates()` for each server in background
 - Live dashboard shows real-time progress
+- Update command runs with `APPLY_TIMEOUT` (default 3600s), not the check
+  phase's `DNF_TIMEOUT` — on timeout the status warns the remote package
+  manager may still be running (the local kill can't stop it)
 - For servers with kernel updates:
-  - Runs appropriate update command (apt-get upgrade / dnf update / yum update)
-  - Detects if kernel was updated (distribution-aware)
+  - Runs appropriate update command (apt-get dist-upgrade / dnf update / yum update)
+  - Detects if kernel was updated (distribution-aware; see Kernel Update Detection)
+  - Captures `/proc/sys/kernel/random/boot_id` before rebooting
   - Initiates reboot with `sudo reboot`
-  - Calls `verify_reboot()` to monitor reboot process
+  - Calls `verify_reboot()` with the pre-reboot boot_id (see Reboot Monitoring)
 - Updates complete simultaneously across all servers
 
-#### **Phase 3.5: Results Summary (lines ~1058-1116)**
+#### **Phase 3.5: Results Summary (lines ~1803-1884)**
 - After all background jobs complete
 - Displays comprehensive results table
 - For each approved server:
   - Reads `${server}.update_type` (kernel_update or no_reboot)
   - Reads `${server}.reboot_status` (success or failed)
-  - Displays colored result indicator (✓ or ✗)
+  - Displays colored result indicator (`GLYPH_OK`/`GLYPH_FAIL`)
 - Shows summary statistics:
   - Servers updated (no reboot)
   - Servers updated and rebooted
   - Servers with issues
 
-#### **Phase 4: Local Server Update (lines ~1168-1310)**
+#### **Phase 4: Local Server Update (lines ~1886-2120)**
 **ONLY executes AFTER all remote servers complete**
 
 This phase is specifically designed to safely update the local server (localhost) without interrupting remote server monitoring:
 
-- Checks if `localhost` is in `approved_servers.txt`
+- Finds the local entry in `SERVERS` via `is_localhost()` (localhost,
+  127.0.0.1, or ::1 — state files are keyed by whatever name was used) and
+  checks its Phase 1 status/output for pending updates. Note: localhost is
+  never written to `approved_servers.txt`; Phase 2 skips it entirely
+- **Skipped entirely in `--dry-run` and `--check-only` modes** (prints an
+  informational note instead — these modes previously fell through and could
+  update and even reboot the local machine)
 - Displays pending updates for localhost
-- Shows package list (distribution-aware formatting)
+- Shows package list (distribution-aware formatting, same yum/dnf section
+  handling as Phase 2)
 - Detects and warns about kernel updates:
-  - ⚠️ Local server will reboot
-  - ⚠️ You will lose your session
+  - Local server will reboot
+  - You will lose your session
 - **First user confirmation**: "Proceed with local server update? [y/N]"
-  - In `--non-interactive` mode: Auto-approves if `--assume-yes` is also set, otherwise skips
+  - `--assume-yes` alone auto-approves (consistent with Phase 2)
+  - `--non-interactive` without `--assume-yes`: skips
 - If approved:
-  - Runs appropriate update command (apt/dnf/yum)
+  - Runs appropriate update command (apt dist-upgrade / dnf / yum) with `APPLY_TIMEOUT`
   - Detects if kernel was updated
   - If kernel updated:
     - **Second user confirmation**: "Reboot local server now? [y/N]"
-      - In `--non-interactive` mode: Auto-approves if `--assume-yes` is also set, otherwise skips
+      - Same mode rules as the first confirmation
     - If approved: 5-second countdown, then `sudo reboot`
     - If declined: Reminds user to reboot manually later
 - All decisions logged to `$LOG_FILE`
@@ -170,67 +216,86 @@ The script uses temporary files in `$TEMP_DIR` (created with 700 permissions):
 | `${server}.output` | Full package manager output for review |
 | `${server}.os_release` | OS distribution name (e.g., "Ubuntu 22.04.3 LTS") |
 | `${server}.kernel` | Kernel version (e.g., "5.15.0-91-generic") |
+| `${server}.pkg_manager` | Detected package manager (`apt`/`dnf`/`yum`) |
 | `${server}.update_type` | Either `kernel_update` or `no_reboot` |
 | `${server}.reboot_status` | Either `success` or `failed` |
+| `${server}.ssh_err` | Captured ssh stderr from the Phase 1 probe, fed to `classify_ssh_error()` on connection failure |
 | `approved_servers.txt` | List of servers approved for updates in Phase 2 |
 
 **Note:** OS and kernel info are written to temp files (not associative arrays) because background processes cannot modify parent process variables.
 
 ### Dashboard Rendering
 
-The `draw_dashboard()` function (lines ~510-587) renders the live status display in a **compact table format**:
+The `draw_dashboard()` function renders the live status display in a **compact table format**:
 
-**Layout:** One line per server (maximizes terminal space)
-- Clears screen with ANSI escape codes
-- Displays header banner
-- Shows column headers: `SERVER | OS DISTRIBUTION | KERNEL VERSION | STATUS`
+**Rendering (flicker-free):**
+- Repaints **in place**: cursor-home (`\033[H`) plus erase-to-end-of-line
+  (`\033[K`) per row and `\033[0J` at the end — no full-screen clear per frame
+- Cursor is hidden (`\033[?25l`) during the live loop and restored after it
+  and in `cleanup()` (so Ctrl-C can't leave the terminal cursorless)
+- **Non-tty mode** (cron, pipes): the live refresh loop is skipped entirely;
+  the script just `wait`s and prints one final plain table with no escape
+  codes. Colors are also disabled when stdout isn't a tty or `NO_COLOR` is set
+
+**Width-aware layout** (`get_term_width()` + `compute_dashboard_layout()`):
+- Terminal width read via `tput cols` each frame (fallback 80)
+- Column widths scale in tiers: full 30/32/28/40 at ≥133 cols, down to
+  20/16/12/status at 80 cols — old-distro consoles, serial lines, and default
+  PuTTY windows are 80 columns, where the old fixed 133-wide layout wrapped
+  every row
+- Long values truncated with "..." via `truncate_field()` (global-return,
+  fork-free, same pattern as `safe_read_file`)
+
+**Layout:** One line per server, columns `SERVER | OS DISTRIBUTION | KERNEL VERSION | STATUS`
 - For each server:
   - Reads status from `${server}.status` file
   - Reads OS info from `${server}.os_release` file
   - Reads kernel from `${server}.kernel` file
   - Applies color coding based on status keywords
-  - Displays single formatted line with all information
+
+**Summary footer:** one line under the table —
+`Active: N | Updates: N | Done: N | Errors: N | Elapsed: MM:SS`
+(elapsed is per phase; `DASH_START` is reset before each dashboard loop).
 
 **Example Output:**
 ```
 SERVER                         OS DISTRIBUTION                  KERNEL VERSION               STATUS
-────────────────────────────────────────────────────────────────────────────────────────────────────────────
+------------------------------------------------------------------------------------------------------------
 192.0.2.10 (web-prod)          Rocky Linux 9.3 (Blue Onyx)      5.14.0-362.24.1.el9_3.x86_64 5 updates available
 192.0.2.20 (db-prod)           Ubuntu 22.04.3 LTS               5.15.0-91-generic            Applying updates (apt)...
+------------------------------------------------------------------------------------------------------------
+Active: 1 | Updates: 1 | Done: 0 | Errors: 0 | Elapsed: 00:12
 ```
-
-**Column Widths:**
-- SERVER: 30 characters
-- OS DISTRIBUTION: 32 characters
-- KERNEL VERSION: 28 characters
-- STATUS: 40 characters (color-coded)
-
-**Smart Truncation:**
-- Long values automatically truncated with "..."
-- Ensures consistent table alignment
 
 **Color Coding:**
 - **Cyan**: Checking/connecting
-- **Green**: Connected, no updates, successfully rebooted (✓), or complete
-- **Yellow**: Updates available or rebooting
+- **Green**: Connected, no updates, successfully rebooted, or complete
+- **Yellow**: Updates available, rebooting, or skipped
 - **Red**: Errors
 - **Magenta**: Applying updates
+
+**Glyphs:** status symbols come from `GLYPH_OK`/`GLYPH_FAIL`/`GLYPH_WARN`/
+`GLYPH_BULLET` globals — UTF-8 (`✓ ✗ ⚠ •`) only when `locale charmap` reports
+UTF-8, ASCII fallbacks (`[OK] [X] [!] *`) otherwise. Old-distro consoles and
+`LANG=C` sessions rendered the raw UTF-8 as mojibake. Never hardcode these
+symbols in status strings; use the globals.
 
 Refresh rate controlled by `$DASHBOARD_REFRESH` variable (default: 1 second).
 
 ### Package Manager Detection
 
-The `detect_package_manager()` function (lines 357-388):
-1. Checks for `apt-get` first
-2. Falls back to `dnf`
-3. Falls back to `yum`
-4. Returns "unknown" if none found
+Detection order is always: `apt-get` → `dnf` → `yum` → "unknown".
 
-Works on both remote servers (via SSH) and localhost.
+- **Phase 1 (all servers):** detection is folded into `probe_server_info()`, which
+  determines the package manager, OS, and kernel in a single SSH round-trip.
+- **`detect_package_manager()`** remains as a standalone helper used only by the
+  Phase 4 localhost fallback (when the cached value is missing). It runs the same
+  apt/dnf/yum probe in one shell invocation and works on both remote servers
+  (via SSH) and localhost.
 
 ### Kernel Update Detection
 
-Distribution-aware detection via `has_kernel_package()` (lines 469-487):
+Distribution-aware detection via `has_kernel_package()`:
 
 **For apt (Debian/Ubuntu):**
 - Checks for: `linux-image`, `linux-headers`, `linux-modules`
@@ -238,29 +303,47 @@ Distribution-aware detection via `has_kernel_package()` (lines 469-487):
 **For dnf/yum (RHEL/CentOS/Fedora):**
 - Uses configurable `KERNEL_PACKAGE_REGEX` (default: `^kernel(-core|-modules)?\b`)
 - Uses `KERNEL_UPDATE_REGEX` for actual update output
+- Multi-line scans strip leading indentation before matching — dnf/yum
+  transaction tables indent package rows by one space, which used to defeat
+  the `^kernel` anchor (the Phase 2 kernel warning never fired for dnf/yum)
 
 Detection happens in two places:
-1. **Phase 2** (lines 991-996): Check package list before approval
-2. **Phase 3** (lines 800-815): Check actual update output to trigger reboot
+1. **Phase 2**: Check package list before approval (warns the user)
+2. **Phase 3/4**: Check actual update output to trigger reboot. For apt this
+   matches only packages actually installed — `^(Setting up|Unpacking)
+   linux-(image|headers|modules)` — NOT any mention of linux-image; the old
+   unanchored grep also matched apt's "kept back" list and rebooted servers
+   where no kernel was installed. `/var/run/reboot-required` (the distro's own
+   signal) is checked as a supplement.
 
 ### Reboot Monitoring
 
-The `verify_reboot()` function (lines 657-745) performs two-phase monitoring:
+`verify_reboot(server, old_boot_id)` — **boot_id comparison is the primary
+strategy**: `apply_updates()` captures `/proc/sys/kernel/random/boot_id`
+before issuing the reboot, and `verify_reboot()` polls until the value read
+over SSH **changes**. A changed boot_id *proves* a reboot happened — even one
+too fast to observe as "down" (small VMs can cycle inside a 5s polling window,
+which the old down/up watcher misread as "did not go down"). boot_id exists on
+any Linux with procfs (RHEL 5+), so old targets are fine.
 
-**Phase 1: Wait for Server to Go Down**
-- Pings server every 5 seconds
-- Maximum wait: 100 seconds (20 attempts × 5s)
-- Verifies reboot command was executed
-- Writes `failed` to `${server}.reboot_status` if timeout
+**boot_id mode:**
+- Polls every `REBOOT_WAIT_INTERVAL` seconds (default: 30s), up to
+  `REBOOT_MAX_WAIT` seconds (default: 900s = 15 minutes)
+- Reachable + new boot_id → `success`
+- Reachable + same boot_id → "not down yet", keep waiting; if the host was
+  *never* unreachable and the boot_id is still unchanged after ~120s, fail
+  fast with "did not go down" (the reboot command never took effect)
+- Unreachable → keep waiting (rebooting)
 
-**Phase 2: Wait for Server to Come Back Up**
-- Checks every `REBOOT_WAIT_INTERVAL` seconds (default: 30s)
-- Maximum wait: `REBOOT_MAX_WAIT` seconds (default: 900s = 15 minutes)
-- Uses `uptime` command to verify server is responsive
-- Updates dashboard: "Rebooting... attempt 5/30 (30s intervals)"
-- Writes `success` to `${server}.reboot_status` on successful reconnection
+**Fallback mode** (boot_id could not be captured): the legacy two-phase watch —
+wait for the server to go down (5s polls, 100s max), then poll `uptime` until
+it responds.
 
-Returns:
+All SSH probes are wrapped in `timeout` (15–20s) — `ConnectTimeout` only
+covers the TCP connect, and a half-up server that accepts and hangs would
+stall the monitor forever.
+
+Writes `success`/`failed` to `${server}.reboot_status`. Returns:
 - **0**: Server successfully rebooted and reconnected
 - **1**: Timeout or error
 
@@ -279,12 +362,18 @@ Returns:
 --version          # Display version
 ```
 
+Environment: setting `NO_COLOR` (any value) disables all ANSI colors, per the
+no-color.org convention. Colors are also auto-disabled when stdout is not a
+tty (cron, pipes), and the live dashboard loop is skipped entirely in that
+case — the final table prints once, plain.
+
 ### Configuration File (server_update.conf)
 
 Optional file with whitelisted variables:
 
 ```bash
-DNF_TIMEOUT=600                    # Package manager command timeout (seconds)
+DNF_TIMEOUT=600                    # Update *check* command timeout (seconds)
+APPLY_TIMEOUT=3600                 # Update *apply* timeout, Phase 3/4 (seconds)
 DASHBOARD_REFRESH=1                # Dashboard update interval (seconds)
 REBOOT_MAX_WAIT=900                # Maximum reboot wait time (seconds)
 REBOOT_WAIT_INTERVAL=30            # Seconds between reboot checks
@@ -292,7 +381,11 @@ KERNEL_PACKAGE_REGEX="..."         # Kernel detection (dnf/yum only)
 KERNEL_UPDATE_REGEX="..."          # Kernel update detection (dnf/yum only)
 ```
 
-**Security:** Config file is parsed safely using `load_config()` function (lines 37-99). Only whitelisted variables are accepted, values are validated.
+`APPLY_TIMEOUT` is deliberately separate from `DNF_TIMEOUT`: big updates on
+slow hardware routinely exceed 10 minutes, and killing a package transaction
+mid-flight risks rpmdb/dpkg corruption.
+
+**Security:** Config file is parsed safely using `load_config()` (lines ~77-166). Only whitelisted variables are accepted, values are validated, and assignment uses `printf -v` (no `eval`, no `source`).
 
 ### Server List Format (server_list.txt)
 
@@ -309,25 +402,38 @@ localhost localhost
 - Comments: Lines starting with `#`
 - Empty lines ignored
 
-Validation performed during parsing (lines 276-352):
+Validation performed during parsing (loop at ~line 562):
 - Server names checked for dangerous characters
 - Ports validated (1-65535)
+- Duplicate server addresses rejected (would silently merge in the keyed arrays)
+- A final line without a trailing newline is still parsed (`read ... || [[ ${#parts[@]} -gt 0 ]]`)
 - Invalid entries skipped with warnings
 
 ## Security Features
 
-### Input Validation (lines 109-177)
+### Input Validation (lines ~213-303)
 - `validate_server_name()`: Prevents command injection in server names
 - `validate_port()`: Ensures port is 1-65535
 - `validate_ip()`: Validates IPv4 and basic IPv6
+- `is_localhost()`: Canonical local-alias check (localhost/127.0.0.1/::1)
 
-### Safe Configuration Loading (lines 37-107)
-- Whitelisted variables only
-- Numeric value validation with maximum caps (604800 seconds = 1 week)
-- **ReDoS protection**: Regex patterns tested with 1-second timeout to prevent catastrophic backtracking
-- **Integer overflow protection**: Rejects values exceeding 604800 seconds
-- Regex pattern syntax validation
-- No arbitrary code execution via `source`
+### Safe Configuration Loading (`load_config()`, lines ~77-166)
+- Whitelisted variables only (`DNF_TIMEOUT`, `APPLY_TIMEOUT`, `DASHBOARD_REFRESH`,
+  `REBOOT_MAX_WAIT`, `REBOOT_WAIT_INTERVAL`, `KERNEL_PACKAGE_REGEX`,
+  `KERNEL_UPDATE_REGEX`)
+- Numeric values validated: digits only, minimum 1 (0 would busy-loop the
+  dashboard / defeat timeouts), maximum 604800 seconds (1 week)
+- **No code execution path**: values are assigned with `printf -v "$key"`,
+  never `eval` or `source` — a value like `$(reboot)` is stored as a literal
+  string
+- **Regex validation without injection**: candidate patterns are passed to
+  `grep -E -- "$value"` as an *argument* (never interpolated into a shell
+  string) with a 1-second `timeout` for ReDoS protection; the exit status is
+  captured directly (`regex_exit=$?` — the old negated capture made the check
+  a no-op, so broken patterns like `kernel[(` were accepted)
+- Syntactically invalid or dangerous values are rejected with a warning; the
+  built-in default is kept
+- Handles a final line without a trailing newline
 
 ### File Permissions
 - Temp directory: 700 (owner-only)
@@ -338,8 +444,9 @@ Validation performed during parsing (lines 276-352):
 - All variable expansions in SSH commands are quoted
 - Prevents word splitting attacks
 
-### Instance Locking (lines 115-139)
+### Instance Locking (`acquire_lock()`, lines ~168-211)
 - **PID-based locking** prevents multiple simultaneous executions
+- Acquisition is atomic (`noclobber` redirection = `O_CREAT|O_EXCL`)
 - Lock file: `/tmp/server_update.lock` contains running process PID
 - Detects and rejects active instances
 - Automatically removes stale locks (when PID no longer exists)
@@ -352,8 +459,11 @@ Validation performed during parsing (lines 276-352):
   into place; `rename(2)` is atomic on a single filesystem
 - A concurrent reader always sees the previous file or the fully-written new
   one — never an empty or half-written file
-- Reads are plain `cat` (no lock needed), which removes the per-read `flock`
-  fork that the old implementation paid on every dashboard refresh
+- Reads use the `read` builtin into a global (`SRF_RESULT`), no lock needed —
+  this removes the per-read `flock` fork the old implementation paid on every
+  dashboard refresh, and also avoids both the `cat` exec and the
+  command-substitution subshell a `var=$(...)` reader would fork (~40x cheaper
+  per read; the full dashboard render measures ~6.8x faster)
 - Semantics are whole-file, last-writer-wins — which is exactly what the
   per-server state model needs (only one writer ever targets a given file)
 - All temp file operations use `safe_write_file()` and `safe_read_file()`
@@ -372,9 +482,19 @@ Validation performed during parsing (lines 276-352):
   - Cleans up the staging file and returns 1 on any failure
   - **Usage:** All temp file writes use this function
 
-- `safe_read_file(file_path, default_value)`: Plain read, no lock
-  - Atomic-rename writes guarantee a reader never observes a partial file
-  - Returns the default value if the file is missing (or vanishes mid-read)
+- `safe_read_file(file_path, default_value)`: fork-free single-line read
+  - **Returns its result in the global `SRF_RESULT`, not on stdout.** Callers do
+    `safe_read_file "$f" "$default"; var="$SRF_RESULT"` (never `var=$(...)`).
+    The global is what lets hot callers skip the command-substitution subshell.
+  - Uses the `read` builtin (no `cat` exec). State files are single-line and
+    `safe_write_file` always appends a trailing newline, so `read` captures the
+    whole value and returns 0
+  - Atomic-rename writes guarantee a reader never observes a partial file, so a
+    missing file is the only failure mode → falls back to the default value
+    (stderr is redirected before the input redirection to swallow the
+    "No such file" message)
+  - A plain global is used instead of a `declare -n` nameref so this still runs
+    on bash 4.0–4.2 controllers (CentOS/RHEL 6/7) — see Implementation Details
   - **Usage:** All temp file reads use this function
 
 **Implementation Details:**
@@ -382,8 +502,12 @@ Validation performed during parsing (lines 276-352):
   file and target both live inside `$TEMP_DIR`, so the move is a rename
 - Staging files: `${original_file}.$BASHPID.tmp` (removed by the `mv`)
 - Requires bash 4.0+ for `$BASHPID` — already mandated by the script's use of
-  associative arrays (`declare -A`)
-- Cheaper than the previous flock approach: no lock file, no fork per read
+  associative arrays (`declare -A`). The reader deliberately avoids `declare -n`
+  (bash 4.3+) so it keeps working on the bash 4.0–4.2 controllers (CentOS/RHEL
+  6/7) that v1.4 restored support for; it returns via a global instead.
+- Cheaper than the previous flock approach: no lock file, no fork per read. The
+  reader goes further — `read` builtin + global return means no `cat` exec and
+  no command-substitution subshell on the dashboard hot path
 
 **Files Protected:**
 - `${server}.status` - Server status messages
@@ -395,19 +519,27 @@ Validation performed during parsing (lines 276-352):
 
 ### Core Functions
 
-- `get_ssh_cmd(server)` (lines 454-473): Returns SSH command string with port
-- `execute_remote_command(server, cmd, timeout)` (lines 475-489): Executes command locally or via SSH
-- `get_display_name(server)` (lines 494-500): Formats "server (nickname)"
-- `has_kernel_package(text, pkg_manager)` (lines 502-520): Checks for kernel packages
-- `parse_dnf_package_count(output)` (lines 522-534): Extracts update count from dnf/yum output
+- `is_localhost(server)` (~line 287): True for localhost/127.0.0.1/::1
+- `get_display_name(server)` (~line 388): Formats "server (nickname)" (cached)
+- `filter_apt_header()` (~line 399): Strips apt's "Listing..." header line (unanchored — matches "Listing..." and "Listing... Done")
+- `detect_package_manager(server)` (~line 643): Standalone apt/dnf/yum probe (Phase 4 localhost fallback only)
+- `probe_server_info(server)` (~line 676): One-round-trip Phase 1 discovery (pkg manager + OS + kernel), doubles as connection test
+- `classify_ssh_error(stderr_file)` (~line 760): Maps ssh stderr to a human-readable reason (auth failed, DNS lookup failed, connection refused, host key changed, ...) via `SSH_ERROR_REASON`
+- `detect_ssh_capabilities()` (~line 788): Version-gates SSH options from local `ssh -V`
+- `get_ssh_cmd(server)` (~line 821): Returns SSH command string with port
+- `execute_remote_command(server, cmd, timeout)` (~line 858): Executes command locally or via SSH
+- `check_disk_space(server)` (~line 889): Pre-flight free-space check (/ and /boot)
+- `has_kernel_package(text, pkg_manager)` (~line 939): Checks for kernel packages
+- `parse_dnf_package_count(output)` (~line 983): Sums Install/Upgrade/Update counts from the dnf/yum Transaction Summary
 
 ### Main Functions
 
-- `draw_dashboard()` (lines 536-620): Renders live status display
-- `update_status(server, status)` (lines 715-721): Writes status to temp file using `safe_write_file()`
-- `check_server_updates(server)` (lines 723-821): Phase 1 - check for updates
-- `verify_reboot(server)` (lines 823-1009): Monitors reboot process
-- `apply_updates(server)` (lines 1011-1110): Phase 3 - apply updates and handle reboots
+- `get_term_width()` / `compute_dashboard_layout()` / `truncate_field()` (~lines 990-1037): Width-aware column layout helpers
+- `draw_dashboard()` (~line 1039): Renders live status display
+- `update_status(server, status)` (~line 1131): Writes status to temp file using `safe_write_file()`
+- `check_server_updates(server)` (~line 1142): Phase 1 - check for updates
+- `verify_reboot(server, old_boot_id)` (~line 1283): Monitors reboot process (boot_id primary, down/up fallback)
+- `apply_updates(server)` (~line 1406): Phase 3 - apply updates and handle reboots
 
 ## SSH Configuration
 
@@ -457,10 +589,10 @@ KERNEL_PACKAGE_REGEX="^kernel(-core|-modules|-devel|-headers)?\b"
 KERNEL_UPDATE_REGEX="(Installing|Upgrading).*(kernel-core|kernel-modules|kernel-devel|kernel)\b"
 ```
 
-For apt systems, modify `has_kernel_package()` function directly (line 478).
+For apt systems, modify `has_kernel_package()` function directly (~line 939).
 
 ### Custom Package Highlighting
-Modify the Phase 2 display sections (lines 947-996) to highlight additional critical packages.
+Modify the Phase 2 display sections (lines ~1660-1720) to highlight additional critical packages.
 
 ## Logging
 
@@ -474,6 +606,103 @@ All operations logged to `server_update.log` with:
 Log file created with 600 permissions. Warns if log exceeds 10MB.
 
 ## Version History
+
+### Unreleased (post-1.4)
+
+**Correctness fixes (2026-07 review):**
+- **apt servers restored to Phase 2**: the review gate only recognized the
+  dnf/yum "Transaction Summary" format, so every apt server was silently
+  dropped from review and could never be approved. Gate now accepts apt's
+  "Listing..." format too
+- **Phase 4 honors `--dry-run`/`--check-only`**: previously fell through and
+  could apply updates and even reboot the local machine in "safe" modes; now
+  skipped entirely with an informational note
+- **Local-alias safety**: `is_localhost()` (localhost/127.0.0.1/::1) used by
+  every phase-skip check — a `127.0.0.1` entry previously slipped past the
+  literal `"localhost"` comparisons and could reboot the control host in
+  Phase 3
+- **apt applies with `dist-upgrade`** (was plain `upgrade`, which holds back
+  kernels arriving as new versioned packages), under
+  `DEBIAN_FRONTEND=noninteractive` with `--force-confdef/--force-confold` so
+  conffile prompts can't hang an unattended run
+- **apt kernel-reboot detection anchored**: only `^(Setting up|Unpacking)
+  linux-(image|headers|modules)` counts (plus `/var/run/reboot-required`) —
+  the old unanchored grep also matched apt's "kept back" list and rebooted
+  servers where no kernel was installed
+- **boot_id-verified reboots**: `apply_updates()` captures
+  `/proc/sys/kernel/random/boot_id` before rebooting; `verify_reboot()` polls
+  for a *changed* id (proves the reboot even when a fast VM cycles inside one
+  polling window), fails fast (~120s) when the reboot command never took
+  effect, and falls back to the legacy down/up watch when boot_id wasn't
+  captured. All SSH probes wrapped in `timeout` so a half-up server can't
+  stall the monitor
+- **`APPLY_TIMEOUT` (default 3600s)**: the apply phase no longer reuses the
+  600s check timeout — killing a package transaction mid-flight risks
+  rpmdb/dpkg corruption; on timeout the status warns the remote package
+  manager may still be running
+- **`parse_dnf_package_count()` rewritten** as an awk sum over
+  `Install`/`Upgrade`/`Update` Transaction Summary lines (RHEL 6 yum included)
+- **`load_config()` hardening**: `printf -v` assignment (no `eval`), zero
+  values rejected, `APPLY_TIMEOUT` whitelisted, and a latent bug fixed where
+  the regex-validation exit status was captured negated — the check was a
+  no-op and accepted broken patterns like `kernel[(`
+- **Atomic lock acquisition**: `acquire_lock()` uses `noclobber`
+  (`O_CREAT|O_EXCL`) instead of check-then-create; stale locks removed and
+  retried once
+- **Parse robustness**: duplicate server addresses rejected; config and
+  server-list files parse a final line without a trailing newline
+
+**Older-distro compatibility (2026-07 review):**
+- **yum check via `echo n | yum update`** — `--assumeno` needs yum 3.4.3 and
+  dies on RHEL 6's yum 3.2.29
+- **Generation-aware yum parsing**: `Updating:` vs `Upgrading:` section
+  headers and `Update N Package(s)` vs `Upgrade` summary lines all accepted
+  (Phase 2 display + package counting)
+- **Glyph fallback**: `GLYPH_OK/FAIL/WARN/BULLET` globals — UTF-8 `✓ ✗ ⚠ •`
+  only when `locale charmap` is UTF-8, ASCII `[OK] [X] [!] *` otherwise
+  (LANG=C consoles rendered mojibake)
+- **80-column dashboards**: width-aware tiered layout replaces the fixed
+  133-wide table that wrapped every row on serial consoles and default PuTTY
+
+**UI improvements (2026-07 review):**
+- **Flicker-free dashboard**: in-place repaint (cursor-home + `\033[K` per
+  row + `\033[0J`), cursor hidden during live loops and restored in
+  `cleanup()`; summary footer (`Active/Updates/Done/Errors/Elapsed`)
+- **Non-tty mode**: live loop skipped under cron/pipes; one plain final table,
+  no escape codes; `NO_COLOR` honored
+- **SSH error classification**: probe stderr captured and mapped to a
+  human-readable reason (auth failed, DNS lookup failed, connection refused,
+  host key changed, timed out, ...) instead of a bare "connection failed"
+- **Phase 2 review controls**: `a` = approve all remaining, `q` = quit review
+- **Phase 4 consistency**: `--assume-yes` alone auto-approves (previously
+  also required `--non-interactive`)
+
+**Earlier unreleased work:**
+- **Single-round-trip discovery**: new `probe_server_info()` detects the package
+  manager and gathers OS/kernel in one remote shell snippet, doubling as the
+  connection test (a `PM=` sentinel in the output proves the remote shell ran).
+  Replaces the old per-attribute sequence (connection test + `detect_package_manager`
+  + 2-4 `gather_system_info` round-trips), cutting Phase 1 discovery from ~5
+  round-trips per server (up to 7 on pre-systemd hosts) to 2. The dead
+  `gather_system_info()` was removed; `detect_package_manager()` is kept for the
+  Phase 4 localhost fallback. Remote snippet is POSIX-sh (works under dash) and
+  parses `PRETTY_NAME` by prefix/suffix stripping, which also handles unquoted
+  values. Verified on RHEL/Alma localhost, an apt-get stub (apt-first ordering),
+  and faked Debian/Ubuntu/Fedora os-release formats; timeout→124 and
+  connect-failure→1 paths exercised with stub ssh.
+- **Fork-free dashboard reads**: `safe_read_file()` now uses the `read` builtin
+  and returns via the global `SRF_RESULT` instead of `cat` + stdout. Hot callers
+  (`draw_dashboard`) skip both the `cat` exec and the command-substitution
+  subshell — ~40x cheaper per read; the full dashboard render measures ~6.8x
+  faster (≈50ms → ≈7ms per refresh at 10 servers). All 9 call sites updated to
+  `safe_read_file f default; var="$SRF_RESULT"`. A global (not a `declare -n`
+  nameref) is used so it still runs on bash 4.0–4.2 (CentOS/RHEL 6/7).
+- **Fork-free kernel-line check**: `has_kernel_package()` matches single-line
+  input with the bash regex engine (`[[ =~ ]]` + `nocasematch`) instead of
+  forking `grep` per package line in the Phase 2 review loops (~200x cheaper per
+  line). Multi-line whole-output scans still use `grep` so `^/$` anchor per line.
+  Behavior verified identical to the old grep against single/multi-line, case,
+  `\b`-boundary, and leading-whitespace inputs.
 
 ### Version 1.4 (Current - 2026-06-03)
 - **Version-aware SSH options**: `detect_ssh_capabilities()` probes the local
@@ -554,7 +783,7 @@ Log file created with 600 permissions. Warns if log exceeds 10MB.
    - All shared data (status, OS info, kernel) must use temp files
    - **CRITICAL**: Always use `safe_write_file()` and `safe_read_file()` for temp file operations
    - Never use direct `cat`, `echo >`, or `>` for temp files - this causes race conditions
-   - File locking prevents corruption from concurrent access
+   - Atomic-rename writes prevent corruption from concurrent access (no flock needed)
 
 5. **Phase 4 (localhost)**: Special handling for local server updates:
    - Only executes AFTER all remote servers complete (Phases 1-3.5)
