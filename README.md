@@ -100,7 +100,8 @@ cd /root/server-update
 | `--dry-run` | Check for updates but don't apply them |
 | `--check-only` | Display available updates without prompting for approval |
 | `--assume-yes` | Automatically approve all updates (use with caution!) |
-| `--non-interactive` | Skip all interactive prompts (for automation/testing) |
+| `--non-interactive` | Skip all interactive prompts (for automation/testing). Without `--assume-yes`, every server is skipped |
+| `--classic-review` | Review servers one at a time instead of using the review screen |
 | `--help`, `-h` | Display usage information |
 | `--version` | Display version information |
 
@@ -251,13 +252,55 @@ local-server localhost
 - Connection failures are displayed with a classified reason (auth, DNS, refused, host key, timeout) but don't stop the script
 
 ### Phase 2: Review & Approval
-- For each server with available updates:
-  - Shows complete list of packages to be updated
-  - Highlights kernel packages in **RED** (distribution-aware)
-  - Displays warning if kernel update will require reboot
-  - Prompts for confirmation: `[y/N/a=yes to all/q=quit review]` (unless in automated mode)
-    - `a` approves this server and all remaining ones; `q` stops the review and skips the rest
-- Builds list of approved servers for Phase 3
+
+Servers that have updates appear on one review screen. Each server keeps its
+own DECISION column, and the package pane shows the packages for the
+highlighted server. The decision stays next to the server name however long the
+package list is.
+
+```
+REVIEW PENDING UPDATES  3 of 5 servers have updates  1 approved, 0 skipped, 2 undecided
+
+  SERVER                  OS DISTRIBUTION              KERNEL VERSION       UPD   DECISION
+------------------------------------------------------------------------------------------
+> 192.0.2.10 (web-prod)   Rocky Linux 9.3 (Blue Onyx)  5.14.0-362.24.1.el9   26 ⚠ [  YES  ]
+  192.0.2.20 (db-prod)    Ubuntu 22.04.3 LTS           5.15.0-91-generic      4 ⚠ [   ?   ]
+  192.0.2.30 (mail)       AlmaLinux 8.9                4.18.0-513.9.1.el8     3   [   ?   ]
+------------------------------------------------------------------------------------------
+ PACKAGES - 192.0.2.10 (web-prod)                            ⚠ KERNEL UPDATE - WILL REBOOT
+  Installing:
+   kernel           x86_64   5.14.0-362.24.1.el9_3   baseos   3.1 M
+   kernel-core      x86_64   5.14.0-362.24.1.el9_3   baseos    16 M
+   openssl          x86_64   1:3.0.7-24.el9          baseos   1.2 M
+  lines 1-9 of 36  (more below)
+------------------------------------------------------------------------------------------
+ up/dn server  PgUp/PgDn packages  y approve  n skip  a all  ENTER apply  q cancel
+```
+
+| Key | Action |
+|-----|--------|
+| Up / Down, k / j | Move between servers. The package pane follows. |
+| PgUp / PgDn, Left / Right | Scroll the package list. |
+| Home / End | Jump to the first or last package line. |
+| y | Approve this server and move down. |
+| n | Skip this server and move down. |
+| Space | Toggle between approve and skip. |
+| a | Approve every server. |
+| ENTER | Apply. Approved servers go to Phase 3. |
+| q or Esc | Cancel. Nothing is approved. |
+
+Details:
+- Kernel packages are shown in **RED** and the row is flagged with ⚠, because
+  those servers reboot after the update
+- A server you never decide on counts as skipped
+- The decisions are written to the log, and printed as a plain table when the
+  screen closes
+
+If the terminal cannot carry the screen, the script falls back to the earlier
+behavior: one server at a time, with the prompt
+`[y/N/a=yes to all/q=quit review]` under the package list. This happens when
+output is not a terminal (cron, pipes), when the window is smaller than 60x14,
+in every automated mode, and whenever you pass `--classic-review`.
 
 ### Phase 3: Parallel Execution
 - Applies updates to all approved servers **simultaneously**
@@ -330,6 +373,13 @@ The script automatically detects and supports:
 - Any OpenSSH client — SSH options are chosen automatically based on the local `ssh -V`: modern clients get `StrictHostKeyChecking=accept-new` and connection multiplexing; old ones (CentOS 6's OpenSSH 5.3, CentOS 7's 7.4) get compatible fallbacks and still work, just without the speedup
 
 ## What's New (Unreleased fixes)
+
+### Review screen
+- ✅ **The approve prompt moved next to the server**: Phase 2 is now one screen — every server keeps its own DECISION column, and a package pane follows the highlighted server. Arrow keys move, `y`/`n`/Space decide, `a` approves all, ENTER applies, `q` cancels
+- ✅ **You can change your mind**: every server stays on screen until you press ENTER, so you can go back and re-decide
+- ✅ **Falls back automatically** to the old one-at-a-time prompts when output is not a terminal, when the window is smaller than 60x14, or when you pass `--classic-review`
+- ✅ **`--non-interactive` no longer blocks**: it promised no prompts but still stopped at the review prompt on a terminal. Without `--assume-yes` it now skips every server
+- ✅ **Kernel highlighting fixed for the review screen**: the red highlight relied on a side effect of how the old loop read its input
 
 ### Correctness
 - ✅ **apt servers restored to review**: the Phase 2 gate only recognized dnf/yum output, so apt servers were silently dropped and could never be approved — fixed

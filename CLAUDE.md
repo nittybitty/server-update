@@ -72,7 +72,9 @@ To prevent multiple instances from running simultaneously (which could cause pac
 - `cleanup()` function removes lock file on exit
 - Triggered by trap on EXIT, INT, TERM signals
 - Ensures clean removal even if script is interrupted
-- Also restores the terminal cursor (`\033[?25h`) if the live dashboard hid it
+- Also restores the terminal cursor (`\033[?25h`) and resets the SGR
+  attributes (`\033[0m`) if a live dashboard or the review screen was
+  drawing, and closes the review screen's keyboard descriptor
 
 **Error Handling:**
 - Clear error messages when another instance is detected
@@ -111,18 +113,101 @@ The script operates in distinct phases:
 - Dashboard updates in real-time (configurable refresh rate)
 - Connection failures are displayed but don't stop execution
 
-#### **Phase 2: Review & Approval (lines ~1610-1760)**
-- For each server with available updates (gate accepts BOTH formats: dnf/yum
-  "Transaction Summary" and apt "Listing..." — the gate previously only knew
-  the dnf format and silently dropped every apt server from review):
+#### **Phase 2: Review & Approval**
+
+Phase 2 has **two front ends over one set of rules**. `collect_review_candidates()`
+builds the candidate list, `render_package_lines()` prints the packages, and
+`apply_review_decision()` records the answer. Both front ends call all three, so
+the rules cannot drift apart.
+
+**Candidate gates** (`collect_review_candidates()`, in this order):
+1. Skip local aliases (`is_localhost()`) — Phase 4 handles them
+2. Skip servers with no `${server}.output` file
+3. Skip servers whose status contains `ERROR` or `No updates`
+4. Skip servers whose output matches neither format: dnf/yum "Transaction
+   Summary" or apt "Listing..." (the gate previously only knew the dnf format
+   and silently dropped every apt server from review)
+
+Each survivor fills one index of the parallel arrays `RV_SERVER`, `RV_NAME`,
+`RV_OSREL`, `RV_KVER`, `RV_PM`, `RV_COUNT`, `RV_KUPD`, `RV_DECISION`.
+
+**Front end 1: the review screen** (`run_review_screen()` + `draw_review()`)
+
+Used when `review_screen_supported()` returns true: stdout is a tty,
+`--classic-review` is off, no automated mode is active, `/dev/tty` is readable,
+and the window is at least 60x14. Otherwise the classic front end runs.
+
+Layout: a server list where each row carries its own DECISION column, and a
+package pane for the highlighted server.
+
+```
+REVIEW PENDING UPDATES  3 of 5 servers have updates  1 approved, 0 skipped, 2 undecided
+
+  SERVER                  OS DISTRIBUTION              KERNEL VERSION       UPD   DECISION
+------------------------------------------------------------------------------------------
+> 192.0.2.10 (web-prod)   Rocky Linux 9.3 (Blue Onyx)  5.14.0-362.24.1.el9   26 ⚠ [  YES  ]
+  192.0.2.20 (db-prod)    Ubuntu 22.04.3 LTS           5.15.0-91-generic      4 ⚠ [   ?   ]
+  192.0.2.30 (mail)       AlmaLinux 8.9                4.18.0-513.9.1.el8     3   [   ?   ]
+------------------------------------------------------------------------------------------
+ PACKAGES - 192.0.2.10 (web-prod)                            ⚠ KERNEL UPDATE - WILL REBOOT
+  Installing:
+   kernel           x86_64   5.14.0-362.24.1.el9_3   baseos   3.1 M     <- RED BOLD
+   ...
+  lines 1-9 of 36  (more below)
+------------------------------------------------------------------------------------------
+ up/dn server  PgUp/PgDn packages  y approve  n skip  a all  ENTER apply  q cancel
+```
+
+Keys:
+
+| Key | Action |
+|-----|--------|
+| Up / Down, k / j | Move the selection. The package pane follows and resets to line 1. |
+| PgUp / PgDn, Left / Right | Scroll the package pane. |
+| Home / End | Jump the package pane to the first or last line. |
+| y | Set the row to YES and move down. |
+| n | Set the row to SKIP and move down. |
+| Space | Toggle the row between YES and SKIP. |
+| a | Set every row to YES. |
+| ENTER | Commit. Every YES row goes to Phase 3, everything else is skipped. |
+| q, Esc | Cancel. Nothing is approved. |
+
+Implementation notes:
+- **Repaints in place**, the same technique as `draw_dashboard()`: cursor-home
+  (`\033[H`), `\033[K` per row, `\033[0J` at the end. No full clear per frame,
+  so no flicker. The cursor is hidden during the loop
+- **Keyboard comes from `/dev/tty` on file descriptor 3**, not stdin, so a
+  redirected stdin cannot answer the review. `cleanup()` closes the descriptor
+- **`read_key()` polls with a one second timeout** and reports `KEY=TIMEOUT`.
+  This is how a resize is noticed: **bash defers a trapped signal until the
+  running builtin returns**, so a `SIGWINCH` trap does NOT interrupt a blocking
+  `read`, and the screen would keep the old width until the next keypress. On
+  timeout the loop re-reads the terminal size and repaints **only if it
+  changed**, so an idle screen emits zero bytes
+- **Columns are measured from the data**, then sized by the dashboard's own
+  `compute_dashboard_layout()`. UPD, the kernel flag, and DECISION are fixed
+  width. The kernel flag column is `${#GLYPH_WARN}` wide, so the ASCII fallback
+  (`[!]`) fits as well as `⚠`
+- **The selected row is drawn in reverse video** (`REVERSE='\033[7m'`, empty
+  under `NO_COLOR`), padded to the table width
+- **Package lines load lazily** through `load_pkg_lines()`, which renders each
+  server once into `$TEMP_DIR/${server}.review` and reads it with `mapfile`.
+  Only one package list is in memory at a time
+- **Decisions are logged** to `$LOG_FILE` and echoed as a plain table by
+  `print_review_summary()` after the screen closes
+
+**Front end 2: the classic loop** (fallback, and `--classic-review`)
+
+One server at a time, prompt under the package list. Unchanged except that it
+now iterates the `RV_*` arrays and records decisions through
+`apply_review_decision()`:
   - Displays server header with nickname
-  - Shows package list (format varies by package manager; dnf/yum uses one
-    sed range over all section headers — `Upgrading:`/`Updating:`/
-    `Installing:`/etc. — so yum hosts show their packages and nothing is
-    printed twice)
+  - Shows the package list (dnf/yum uses one sed range over all section
+    headers, including `Upgrading:`, `Updating:`, and `Installing:` — so yum hosts show
+    their packages and nothing is printed twice)
   - Highlights kernel packages in **RED BOLD** using `has_kernel_package()`
     - For apt: `linux-image`, `linux-headers`, `linux-modules`
-    - For dnf/yum: Uses `KERNEL_PACKAGE_REGEX` config
+    - For dnf/yum: Uses the `KERNEL_PACKAGE_REGEX` configuration value
   - Displays warning if kernel update detected
   - Prompts `[y/N/a=yes to all/q=quit review]`:
     - `y`: approve this server
@@ -133,8 +218,12 @@ The script operates in distinct phases:
     - `--dry-run`: Skip all updates
     - `--check-only`: Display only, don't prompt
     - `--assume-yes`: Auto-approve all
-    - `--non-interactive`: Skips all interactive prompts
-  - Approved servers written to `$TEMP_DIR/approved_servers.txt`
+    - `--non-interactive`: Skip every server. Without `--assume-yes` nobody can
+      approve, and the flag promises no prompts. Phase 2 previously ignored the
+      flag and blocked on the prompt
+
+Approved servers are written to `$TEMP_DIR/approved_servers.txt` by
+`apply_review_decision()`, the only writer of that file in Phase 2.
 
 #### **Phase 3: Parallel Execution (lines ~1762-1800)**
 - Reads approved servers list
@@ -220,6 +309,7 @@ The script uses temporary files in `$TEMP_DIR` (created with 700 permissions):
 | `${server}.update_type` | Either `kernel_update` or `no_reboot` |
 | `${server}.reboot_status` | Either `success` or `failed` |
 | `${server}.ssh_err` | Captured ssh stderr from the Phase 1 probe, fed to `classify_ssh_error()` on connection failure |
+| `${server}.review` | Package list rendered as plain text for the review screen's package pane (written once, on first selection) |
 | `approved_servers.txt` | List of servers approved for updates in Phase 2 |
 
 **Note:** OS and kernel info are written to temp files (not associative arrays) because background processes cannot modify parent process variables.
@@ -324,9 +414,13 @@ Distribution-aware detection via `has_kernel_package()`:
 **For dnf/yum (RHEL/CentOS/Fedora):**
 - Uses configurable `KERNEL_PACKAGE_REGEX` (default: `^kernel(-core|-modules)?\b`)
 - Uses `KERNEL_UPDATE_REGEX` for actual update output
-- Multi-line scans strip leading indentation before matching — dnf/yum
-  transaction tables indent package rows by one space, which used to defeat
-  the `^kernel` anchor (the Phase 2 kernel warning never fired for dnf/yum)
+- **Both scan paths strip leading indentation** before matching — dnf/yum
+  transaction tables indent package rows by one space, which defeats the
+  `^kernel` anchor. The multi-line path always did this. The single-line path
+  used to depend on its callers: the old Phase 2 loop read lines with `read`
+  (no `IFS=`), which strips leading whitespace as a side effect. The review
+  screen keeps the indentation so the dnf table stays aligned, so the stripping
+  now happens inside `has_kernel_package()` and both paths answer the same
 
 Detection happens in two places:
 1. **Phase 2**: Check package list before approval (warns the user)
@@ -379,6 +473,7 @@ Writes `success`/`failed` to `${server}.reboot_status`. Returns:
 --check-only       # Display updates without prompting
 --assume-yes       # Auto-approve all updates (dangerous!)
 --non-interactive  # Skip all interactive prompts (for automation/testing)
+--classic-review   # Review servers one at a time instead of the review screen
 --help, -h         # Display usage information
 --version          # Display version
 ```
@@ -543,6 +638,7 @@ Validation performed during parsing (loop at ~line 562):
 ### Core Functions
 
 - `is_localhost(server)` (~line 287): True for localhost/127.0.0.1/::1
+- `read_key()`: Reads one keystroke from fd 3 into the global `KEY`. Decodes arrow/Home/End/PgUp/PgDn escape sequences. Polls with a one second timeout and reports `KEY=TIMEOUT`
 - `get_display_name(server)` (~line 388): Formats "server (nickname)" (cached)
 - `filter_apt_header()` (~line 399): Strips apt's "Listing..." header line (unanchored — matches "Listing..." and "Listing... Done")
 - `detect_package_manager(server)` (~line 643): Standalone apt/dnf/yum probe (Phase 4 localhost fallback only)
@@ -557,9 +653,14 @@ Validation performed during parsing (loop at ~line 562):
 
 ### Main Functions
 
-- `get_term_width()` / `compute_dashboard_layout()` / `truncate_field()` (~lines 988-1090): Width detection and data-driven column layout
+- `get_term_width()` / `get_term_height()` / `compute_dashboard_layout()` / `truncate_field()`: Size detection (results in `TERM_WIDTH` / `TERM_HEIGHT`) and data-driven column layout. Only the review screen needs the height
 - `draw_dashboard()` (~line 1039): Renders live status display
 - `update_status(server, status)` (~line 1131): Writes status to temp file using `safe_write_file()`
+- `collect_review_candidates()`: Phase 2 - fills the `RV_*` arrays with every server that has updates to review
+- `render_package_lines(server, pkg_manager)`: Phase 2 - prints one server's package list as plain text (both front ends use it)
+- `apply_review_decision(server, decision)`: Phase 2 - the only writer of `approved_servers.txt`; logs the decision
+- `review_screen_supported()`: True when the terminal can carry the review screen
+- `draw_review()` / `run_review_screen()` / `load_pkg_lines()` / `print_review_summary()`: The review screen
 - `check_server_updates(server)` (~line 1142): Phase 1 - check for updates
 - `verify_reboot(server, old_boot_id)` (~line 1283): Monitors reboot process (boot_id primary, down/up fallback)
 - `apply_updates(server)` (~line 1406): Phase 3 - apply updates and handle reboots
@@ -636,6 +737,37 @@ Log file created with 600 permissions. Warns if log exceeds 10MB.
 ## Version History
 
 ### Unreleased (post-1.4)
+
+**Interactive review screen (2026-08):**
+- **Phase 2 is now a split screen** on any terminal that can carry it: a server
+  list where each row carries its own DECISION column, plus a scrolling package
+  pane for the highlighted server. Arrow keys move between servers,
+  `y`/`n`/Space set a decision, `a` approves everything, ENTER commits, `q`
+  cancels. The old behavior — one server at a time, a prompt after each package
+  list, and no way back — remains as the fallback
+- **One set of rules, two front ends**: `collect_review_candidates()`,
+  `render_package_lines()`, and `apply_review_decision()` are shared, so the
+  screen and the classic loop cannot drift apart. `apply_review_decision()` is
+  the only writer of `approved_servers.txt` and logs every decision
+- **Automatic fallback**: the screen opens only on a tty, with a readable
+  `/dev/tty`, in a window of at least 60x14, and outside every automated mode.
+  `--classic-review` forces the old path
+- **Resize works without a signal trap**: `read_key()` polls with a one second
+  timeout, because bash defers a trapped signal until the running builtin
+  returns — a `SIGWINCH` trap does NOT interrupt a blocking `read`. An idle
+  screen still emits zero bytes: it repaints only when the size changed
+- **`get_term_height()`** added, mirroring `get_term_width()`'s source order
+  (`stty` before `tput`, for the same terminfo reason)
+- **`has_kernel_package()` strips leading indentation on single-line input**
+  too. It used to rely on the caller's `read` doing it, which broke the red
+  kernel highlight as soon as a caller preserved the dnf table's indentation
+- **`--non-interactive` no longer blocks in Phase 2**: the flag promises no
+  prompts, but the review loop still stopped at `read -r response` on a
+  terminal. Without `--assume-yes` it now skips every server, which is how
+  Phase 4 already treated it
+- **`cleanup()` resets the SGR attributes** (`\033[0m`) as well as restoring
+  the cursor, so Ctrl-C on a reverse-video row cannot leave the terminal
+  inverted, and closes the review keyboard descriptor
 
 **Dashboard width and column fixes (2026-08 review):**
 - **Width detection no longer trusts `tput` alone**: `get_term_width()` now

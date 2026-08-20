@@ -25,9 +25,10 @@ if [[ "$IS_TTY" == true && -z "${NO_COLOR:-}" ]]; then
     CYAN='\033[0;36m'
     MAGENTA='\033[0;35m'
     BOLD='\033[1m'
+    REVERSE='\033[7m' # Selected row in the review screen
     NC='\033[0m' # No Color
 else
-    RED=''; GREEN=''; YELLOW=''; BLUE=''; CYAN=''; MAGENTA=''; BOLD=''; NC=''
+    RED=''; GREEN=''; YELLOW=''; BLUE=''; CYAN=''; MAGENTA=''; BOLD=''; REVERSE=''; NC=''
 fi
 
 # Status glyphs: UTF-8 symbols only when the locale can render them. Old-distro
@@ -426,6 +427,8 @@ show_help() {
     echo "  --check-only       Display available updates without prompting"
     echo "  --assume-yes       Automatically approve all updates (use with caution)"
     echo "  --non-interactive  Skip all interactive prompts (for automation/testing)"
+    echo "  --classic-review   Review servers one at a time instead of the"
+    echo "                     interactive review screen"
     echo "  --version          Display version information"
     echo "  --help             Display this help message"
     echo ""
@@ -454,6 +457,7 @@ DRY_RUN=false
 CHECK_ONLY=false
 ASSUME_YES=false
 NON_INTERACTIVE=false
+CLASSIC_REVIEW=false
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -476,6 +480,10 @@ while [[ $# -gt 0 ]]; do
             NON_INTERACTIVE=true
             shift
             ;;
+        --classic-review)
+            CLASSIC_REVIEW=true
+            shift
+            ;;
         --version)
             show_version
             ;;
@@ -494,8 +502,13 @@ done
 
 # Cleanup function to run on exit
 cleanup() {
-    # Restore the cursor if the dashboard hid it (e.g. Ctrl-C mid-refresh)
-    [[ "${IS_TTY:-false}" == true ]] && printf '\033[?25h'
+    # Restore the cursor and clear any leftover attribute (the review screen
+    # draws the selected row in reverse video, so Ctrl-C mid-frame would
+    # otherwise leave the terminal inverted).
+    [[ "${IS_TTY:-false}" == true ]] && printf '\033[?25h\033[0m'
+
+    # Close the review screen's keyboard descriptor if it is still open
+    exec 3<&- 2>/dev/null
 
     # Kill all background jobs spawned by this script
     # This prevents orphaned dnf/yum processes that can hang future runs
@@ -971,17 +984,22 @@ has_kernel_package() {
         # Strip leading indentation first: dnf/yum transaction tables indent
         # package rows by one space, which defeated the ^kernel anchor in
         # KERNEL_PACKAGE_REGEX (the Phase 2 kernel warning never fired for
-        # dnf/yum whole-output scans). Single-line callers get their input
-        # from `read`, which already strips leading whitespace.
+        # dnf/yum whole-output scans).
         echo "$text" | sed 's/^[[:space:]]*//' | grep -qiE "$regex"
         return $?
     fi
 
-    # Single line: replicate grep -i case-insensitivity via nocasematch, then
-    # restore the prior shell state (shopt -q is a builtin, so no fork).
+    # Single line: strip the same leading indentation the multi-line path
+    # strips, so both paths answer the same for the same package row. Callers
+    # that keep the indentation for display (the review screen reads package
+    # lines with mapfile) depend on this.
+    local subject="${text#"${text%%[![:space:]]*}"}"
+
+    # Replicate grep -i case-insensitivity via nocasematch, then restore the
+    # prior shell state (shopt -q is a builtin, so no fork).
     local rc restore=0
     shopt -q nocasematch || { shopt -s nocasematch; restore=1; }
-    [[ "$text" =~ $regex ]]; rc=$?
+    [[ "$subject" =~ $regex ]]; rc=$?
     (( restore )) && shopt -u nocasematch
     return $rc
 }
@@ -1035,6 +1053,101 @@ get_term_width() {
     else
         TERM_WIDTH=80
     fi
+}
+
+# Terminal height detection. Result in the global TERM_HEIGHT.
+#
+# Same source order and same reasoning as get_term_width: `tput lines` answers
+# from terminfo and reports 24 for an unknown $TERM, so `stty size` (which asks
+# the kernel) goes first. Only the review screen needs this -- the dashboard
+# prints one line per server and lets the terminal scroll.
+# Order: stty on /dev/tty, stty on stderr, tput lines, LINES, then 24.
+get_term_height() {
+    local h=""
+
+    # stty prints "rows cols"; keep the first field
+    h=$(stty size 2>/dev/null </dev/tty); h="${h%% *}"
+    if ! [[ "$h" =~ ^[0-9]+$ ]] || (( h < 10 )); then
+        h=$(stty size 2>/dev/null <&2); h="${h%% *}"
+    fi
+    if ! [[ "$h" =~ ^[0-9]+$ ]] || (( h < 10 )); then
+        h=$(tput lines 2>/dev/null)
+    fi
+    if ! [[ "$h" =~ ^[0-9]+$ ]] || (( h < 10 )); then
+        h="${LINES:-}"
+    fi
+
+    if [[ "$h" =~ ^[0-9]+$ ]] && (( h >= 10 )); then
+        TERM_HEIGHT=$h
+    else
+        TERM_HEIGHT=24
+    fi
+}
+
+# Read one keystroke from file descriptor 3 and name it in the global KEY.
+#
+# Returns via a global for the same reason safe_read_file and truncate_field do:
+# a command substitution would fork a subshell on every keypress.
+#
+# Arrow and navigation keys arrive as an escape sequence of two or three more
+# bytes. The short -t timeout separates a real Escape key (nothing follows)
+# from the start of a sequence. Terminals disagree on the last group: xterm
+# sends ESC [ H for Home, while others send ESC O H, so both are mapped.
+#
+# `read -n1` strips the delimiter, so pressing Enter yields an empty string.
+#
+# The first read has a one second timeout and reports KEY="TIMEOUT" when it
+# expires. That is how the screen notices a resize: bash defers a trapped
+# signal until the running builtin returns, so a SIGWINCH trap does NOT
+# interrupt a blocking read, and the screen would keep the old width until the
+# next keypress. Polling costs one wakeup per second and needs no trap.
+#
+# Returns 1 only at real end of input.
+KEY=""
+KEY_POLL=1
+read_key() {
+    local k="" rest="" rc=0
+
+    IFS= read -rsn1 -t "$KEY_POLL" -u 3 k
+    rc=$?
+    if (( rc != 0 )); then
+        # Bash returns a status above 128 when the read times out, and 1 at
+        # end of input
+        if (( rc > 128 )); then
+            KEY="TIMEOUT"
+            return 0
+        fi
+        KEY="EOF"
+        return 1
+    fi
+
+    if [[ "$k" == $'\033' ]]; then
+        IFS= read -rsn2 -t 0.05 -u 3 rest 2>/dev/null
+        case "$rest" in
+            '[A'|'OA') KEY="UP" ;;
+            '[B'|'OB') KEY="DOWN" ;;
+            '[C'|'OC') KEY="RIGHT" ;;
+            '[D'|'OD') KEY="LEFT" ;;
+            '[H'|'OH'|'[1') KEY="HOME" ;;
+            '[F'|'OF'|'[4') KEY="END" ;;
+            '[5') KEY="PGUP" ;;
+            '[6') KEY="PGDN" ;;
+            '') KEY="ESC" ;;
+            *) KEY="OTHER" ;;
+        esac
+        # Sequences of the form ESC [ N ~ have one more byte to discard
+        case "$rest" in
+            '[1'|'[4'|'[5'|'[6') IFS= read -rsn1 -t 0.05 -u 3 rest 2>/dev/null ;;
+        esac
+        return 0
+    fi
+
+    if [[ -z "$k" ]]; then
+        KEY="ENTER"
+    else
+        KEY="$k"
+    fi
+    return 0
 }
 
 # Column headers, the smallest width each column can drop to, and the widest
@@ -1237,6 +1350,480 @@ update_status() {
     local server="$1"
     local status="$2"
     safe_write_file "$TEMP_DIR/${server}.status" "$status"
+}
+
+# ============================================================================
+# PHASE 2 REVIEW
+# ============================================================================
+# Phase 2 has two front ends over one set of rules:
+#   - run_review_screen(): a split-screen picker (server list on top with the
+#     decision on the right, packages for the highlighted server below)
+#   - the classic loop: one server at a time, prompt under the package list
+# Both read the same candidate arrays, render packages with the same function,
+# and record decisions through the same function, so the rules cannot drift.
+# ============================================================================
+
+# Parallel arrays. Index i describes one server that has updates to review.
+RV_SERVER=()     # address, exactly as written in server_list.txt
+RV_NAME=()       # "address (nickname)"
+RV_OSREL=()      # OS release, "--" when unknown
+RV_KVER=()       # running kernel version, "--" when unknown
+RV_PM=()         # apt / dnf / yum
+RV_COUNT=()      # pending update count, "?" when the status cannot be parsed
+RV_KUPD=()       # true when the update includes a kernel (reboot follows)
+RV_DECISION=()   # yes / no / ask
+
+# Collect every server that Phase 2 must review.
+# Applies the same four gates the review has always applied, in the same order:
+# local alias, output file present, status usable, and output in a format that
+# proves updates exist.
+collect_review_candidates() {
+    RV_SERVER=(); RV_NAME=(); RV_OSREL=(); RV_KVER=(); RV_PM=()
+    RV_COUNT=(); RV_KUPD=(); RV_DECISION=()
+
+    local server status output_file pm count os_release kernel output_content
+
+    for server in "${SERVERS[@]}"; do
+        # Local aliases (localhost/127.0.0.1/::1) are handled in Phase 4
+        is_localhost "$server" && continue
+
+        output_file="$TEMP_DIR/${server}.output"
+        [[ -f "$output_file" ]] || continue
+
+        safe_read_file "$TEMP_DIR/${server}.status" "Unknown"
+        status="$SRF_RESULT"
+
+        # Skip servers with errors or nothing to do
+        [[ "$status" == *"ERROR"* || "$status" == *"No updates"* ]] && continue
+
+        # Verify updates are actually available. dnf/yum previews contain
+        # "Transaction Summary"; apt output starts with "Listing..." -- this
+        # gate previously only knew the dnf format, which silently dropped
+        # every apt server from review (they could never be approved).
+        grep -q -e "Transaction Summary" -e "^Listing" "$output_file" || continue
+
+        pm=$(get_pkg_manager "$server")
+
+        # check_server_updates writes the status as "N updates available"
+        count="${status%% *}"
+        [[ "$count" =~ ^[0-9]+$ ]] || count="?"
+
+        safe_read_file "$TEMP_DIR/${server}.os_release" "--"
+        os_release="$SRF_RESULT"
+        [[ -z "$os_release" || "$os_release" == "Unknown" ]] && os_release="--"
+
+        safe_read_file "$TEMP_DIR/${server}.kernel" "--"
+        kernel="$SRF_RESULT"
+        [[ -z "$kernel" || "$kernel" == "Unknown" ]] && kernel="--"
+
+        output_content=$(cat "$output_file")
+
+        RV_SERVER+=("$server")
+        RV_NAME+=("$(get_display_name "$server")")
+        RV_OSREL+=("$os_release")
+        RV_KVER+=("$kernel")
+        RV_PM+=("$pm")
+        RV_COUNT+=("$count")
+        if has_kernel_package "$output_content" "$pm"; then
+            RV_KUPD+=("true")
+        else
+            RV_KUPD+=("false")
+        fi
+        RV_DECISION+=("ask")
+    done
+}
+
+# Print the package list for one server as plain text, one package per line.
+# Callers add color. Both Phase 2 front ends use this, so the package manager
+# quirks live in one place.
+# Parameters: $1 = server address, $2 = package manager
+render_package_lines() {
+    local server="$1"
+    local pkg_manager="$2"
+    local output_file="$TEMP_DIR/${server}.output"
+
+    case "$pkg_manager" in
+        apt)
+            filter_apt_header "$output_file"
+            ;;
+        dnf|yum)
+            # One pass over the whole package table: from the first section
+            # header to the Transaction Summary. The header alternation matters
+            # for old distros -- dnf says "Upgrading:" but yum (CentOS 6/7) says
+            # "Updating:", so an Upgrading-only range shows an EMPTY package
+            # list on yum hosts. A single range also avoids the duplicate
+            # output that per-section ranges produce when both Installing: and
+            # Upgrading: sections are present.
+            sed -n '/^\(Installing\|Upgrading\|Updating\|Removing\|Downgrading\|Reinstalling\)[^:]*:[[:space:]]*$/,/^Transaction Summary/p' "$output_file" | head -n -1
+
+            # Transaction summary (total packages, download size)
+            echo ""
+            sed -n '/^Transaction Summary/,/^Total download size/p' "$output_file"
+            ;;
+    esac
+}
+
+# Record one review decision. This is the only writer of approved_servers.txt.
+# Parameters: $1 = server address, $2 = decision (yes = approve, else skip)
+apply_review_decision() {
+    local server="$1"
+    local decision="$2"
+
+    if [[ "$decision" == "yes" ]]; then
+        echo "$server" >> "$TEMP_DIR/approved_servers.txt"
+        echo "$(date) - Review: updates approved for $server" >> "$LOG_FILE"
+    else
+        update_status "$server" "Skipped by user"
+        echo "$(date) - Review: updates skipped for $server" >> "$LOG_FILE"
+    fi
+}
+
+# ----------------------------------------------------------------------------
+# Review screen
+# ----------------------------------------------------------------------------
+# Fixed-width decision tokens. All three are the same length, so the column
+# never changes width as you change your mind.
+readonly DEC_YES="[  YES  ]" DEC_NO="[  SKIP ]" DEC_ASK="[   ?   ]"
+readonly REVIEW_MIN_WIDTH=60 REVIEW_MIN_HEIGHT=14
+
+RV_CUR=0          # highlighted row
+RV_TOP=0          # first row visible in the server list
+PKG_TOP=0         # first line visible in the package pane
+PKG_PAGE=5        # package pane height, set by draw_review for PgUp/PgDn
+PKG_CACHE_IDX=-1  # which row PKG_LINES currently holds
+PKG_LINES=()
+
+# Load the package list for one row into PKG_LINES, rendering it once per
+# server into a temp file. Only one list is held in memory at a time.
+# Parameters: $1 = row index
+load_pkg_lines() {
+    local idx="$1"
+    [[ "$PKG_CACHE_IDX" == "$idx" ]] && return
+
+    local file="$TEMP_DIR/${RV_SERVER[$idx]}.review"
+    if [[ ! -f "$file" ]]; then
+        render_package_lines "${RV_SERVER[$idx]}" "${RV_PM[$idx]}" > "$file" 2>/dev/null
+    fi
+
+    PKG_LINES=()
+    mapfile -t PKG_LINES < "$file" 2>/dev/null
+    PKG_CACHE_IDX="$idx"
+}
+
+# Render one full frame of the review screen.
+#
+# Repaints in place exactly like draw_dashboard: cursor home, erase to end of
+# line on every row, erase to end of screen at the finish. No full clear, so
+# there is no flicker.
+draw_review() {
+    local eol=$'\033[K'
+    printf '\033[H'
+
+    get_term_width
+    get_term_height
+
+    local n=${#RV_SERVER[@]}
+    local i
+
+    # --- column widths ------------------------------------------------------
+    # UPD, the kernel flag, and DECISION are fixed. SERVER, OS, and KERNEL
+    # share what is left, using the dashboard's own shrink rules.
+    local col_upd=3 col_flag=${#GLYPH_WARN} col_dec=${#DEC_ASK}
+    local nat_srv=${#HDR_SRV} nat_os=${#HDR_OS} nat_krn=${#HDR_KRN}
+    local n_yes=0 n_no=0
+
+    for i in "${!RV_SERVER[@]}"; do
+        (( ${#RV_NAME[$i]} > nat_srv ))  && nat_srv=${#RV_NAME[$i]}
+        (( ${#RV_OSREL[$i]} > nat_os ))  && nat_os=${#RV_OSREL[$i]}
+        (( ${#RV_KVER[$i]} > nat_krn ))  && nat_krn=${#RV_KVER[$i]}
+        (( ${#RV_COUNT[$i]} > col_upd )) && col_upd=${#RV_COUNT[$i]}
+        [[ "${RV_DECISION[$i]}" == "yes" ]] && (( n_yes++ ))
+        [[ "${RV_DECISION[$i]}" == "no" ]]  && (( n_no++ ))
+    done
+
+    # Two columns for the cursor, then one separator before each fixed column.
+    local avail=$(( TERM_WIDTH - 2 - col_upd - col_flag - col_dec - 3 ))
+    compute_dashboard_layout "$avail" "$nat_srv" "$nat_os" "$nat_krn" 0
+
+    # --- pane heights -------------------------------------------------------
+    # Nine lines of chrome, plus one spare so the frame never scrolls.
+    local body=$(( TERM_HEIGHT - 10 ))
+    (( body < 4 )) && body=4
+
+    local list_h=$(( body / 2 ))
+    (( list_h < 2 )) && list_h=2
+    (( list_h > n )) && list_h=$n
+    local pkg_h=$(( body - list_h ))
+    (( pkg_h < 2 )) && pkg_h=2
+    PKG_PAGE=$pkg_h
+
+    # --- viewports ----------------------------------------------------------
+    # Clamp to the last row first, then to the first, so an empty list cannot
+    # leave a negative index behind (bash 4.0 and 4.1 have no negative indices)
+    (( RV_CUR > n - 1 )) && RV_CUR=$(( n - 1 ))
+    (( RV_CUR < 0 )) && RV_CUR=0
+    (( RV_CUR < RV_TOP )) && RV_TOP=$RV_CUR
+    (( RV_CUR >= RV_TOP + list_h )) && RV_TOP=$(( RV_CUR - list_h + 1 ))
+    local max_top=$(( n - list_h ))
+    (( max_top < 0 )) && max_top=0
+    (( RV_TOP > max_top )) && RV_TOP=$max_top
+    (( RV_TOP < 0 )) && RV_TOP=0
+
+    load_pkg_lines "$RV_CUR"
+    local pkg_n=${#PKG_LINES[@]}
+    local pkg_max=$(( pkg_n - pkg_h ))
+    (( pkg_max < 0 )) && pkg_max=0
+    (( PKG_TOP > pkg_max )) && PKG_TOP=$pkg_max
+    (( PKG_TOP < 0 )) && PKG_TOP=0
+
+    # --- title --------------------------------------------------------------
+    local box sep
+    printf -v box '%*s' "$TERM_WIDTH" ''
+    sep=${box// /-}
+
+    # Two title forms, because the long one does not fit a 60-column window
+    if (( TERM_WIDTH >= 84 )); then
+        printf "${BOLD}${BLUE}REVIEW PENDING UPDATES${NC}  ${BOLD}%d of %d servers have updates  %d approved, %d skipped, %d undecided${NC}%s\n" \
+            "$n" "${#SERVERS[@]}" "$n_yes" "$n_no" "$(( n - n_yes - n_no ))" "$eol"
+    else
+        printf "${BOLD}${BLUE}REVIEW UPDATES${NC}  ${BOLD}%d/%d servers  %d yes  %d skip  %d ?${NC}%s\n" \
+            "$n" "${#SERVERS[@]}" "$n_yes" "$n_no" "$(( n - n_yes - n_no ))" "$eol"
+    fi
+    printf "%s\n" "$eol"
+
+    # --- server list --------------------------------------------------------
+    local h_os="$HDR_OS" h_krn="$HDR_KRN"
+    (( COL_OS  < ${#HDR_OS}  )) && h_os="OS"
+    (( COL_KRN < ${#HDR_KRN} )) && h_krn="KERNEL"
+    truncate_field "$h_os" "$COL_OS"; h_os="$TRUNC_RESULT"
+    truncate_field "$h_krn" "$COL_KRN"; h_krn="$TRUNC_RESULT"
+
+    printf "${BOLD}  %-*s %-*s %-*s %*s %-*s %s${NC}%s\n" \
+        "$COL_SRV" "$HDR_SRV" "$COL_OS" "$h_os" "$COL_KRN" "$h_krn" \
+        "$col_upd" "UPD" "$col_flag" "" "DECISION" "$eol"
+    printf "${BLUE}%s${NC}%s\n" "$sep" "$eol"
+
+    local srv os krn flag dec row rowlen
+    rowlen=$(( TERM_WIDTH - 3 ))
+    (( rowlen < 20 )) && rowlen=20
+
+    for (( i = RV_TOP; i < RV_TOP + list_h && i < n; i++ )); do
+        truncate_field "${RV_NAME[$i]}" "$COL_SRV";  srv="$TRUNC_RESULT"
+        truncate_field "${RV_OSREL[$i]}" "$COL_OS";  os="$TRUNC_RESULT"
+        truncate_field "${RV_KVER[$i]}" "$COL_KRN";  krn="$TRUNC_RESULT"
+
+        flag=""
+        [[ "${RV_KUPD[$i]}" == "true" ]] && flag="$GLYPH_WARN"
+
+        case "${RV_DECISION[$i]}" in
+            yes) dec="$DEC_YES" ;;
+            no)  dec="$DEC_NO" ;;
+            *)   dec="$DEC_ASK" ;;
+        esac
+
+        printf -v row "%-*s %-*s %-*s %*s %-*s %s" \
+            "$COL_SRV" "$srv" "$COL_OS" "$os" "$COL_KRN" "$krn" \
+            "$col_upd" "${RV_COUNT[$i]}" "$col_flag" "$flag" "$dec"
+
+        if (( i == RV_CUR )); then
+            # Pad the whole row so the highlight spans the table, and close the
+            # attribute before the erase so it does not paint the rest inverted
+            printf -v row "%-*s" "$rowlen" "$row"
+            printf "${BOLD}${REVERSE}> %s${NC}%s\n" "$row" "$eol"
+        elif [[ "${RV_DECISION[$i]}" == "yes" ]]; then
+            printf "  ${GREEN}%s${NC}%s\n" "$row" "$eol"
+        elif [[ "${RV_DECISION[$i]}" == "no" ]]; then
+            printf "  ${YELLOW}%s${NC}%s\n" "$row" "$eol"
+        else
+            printf "  %s%s\n" "$row" "$eol"
+        fi
+    done
+
+    # --- package pane -------------------------------------------------------
+    printf "${BLUE}%s${NC}%s\n" "$sep" "$eol"
+
+    local hdr
+    printf -v hdr " PACKAGES - %s" "${RV_NAME[$RV_CUR]}"
+    truncate_field "$hdr" "$(( TERM_WIDTH - 34 ))"; hdr="$TRUNC_RESULT"
+    if [[ "${RV_KUPD[$RV_CUR]}" == "true" ]]; then
+        printf "${BOLD}%-*s${NC}${YELLOW}${BOLD}%s KERNEL UPDATE - WILL REBOOT${NC}%s\n" \
+            "$(( TERM_WIDTH - 32 ))" "$hdr" "$GLYPH_WARN" "$eol"
+    else
+        printf "${BOLD}%s${NC}%s\n" "$hdr" "$eol"
+    fi
+
+    local line shown=0
+    for (( i = PKG_TOP; i < PKG_TOP + pkg_h && i < pkg_n; i++ )); do
+        truncate_field "${PKG_LINES[$i]}" "$(( TERM_WIDTH - 2 ))"; line="$TRUNC_RESULT"
+        if has_kernel_package "$line" "${RV_PM[$RV_CUR]}"; then
+            printf "  ${RED}${BOLD}%s${NC}%s\n" "$line" "$eol"
+        else
+            printf "  %s%s\n" "$line" "$eol"
+        fi
+        (( shown++ ))
+    done
+    for (( i = shown; i < pkg_h; i++ )); do
+        printf "%s\n" "$eol"
+    done
+
+    # --- footers ------------------------------------------------------------
+    local range
+    if (( pkg_n == 0 )); then
+        range="no package detail available"
+    else
+        printf -v range "lines %d-%d of %d" \
+            "$(( PKG_TOP + 1 ))" "$(( PKG_TOP + shown ))" "$pkg_n"
+        (( PKG_TOP + shown < pkg_n )) && range="$range  (more below)"
+        (( PKG_TOP > 0 )) && range="(more above)  $range"
+    fi
+    printf "${CYAN}  %s${NC}%s\n" "$range" "$eol"
+    printf "${BLUE}%s${NC}%s\n" "$sep" "$eol"
+
+    if (( TERM_WIDTH >= 96 )); then
+        printf "${BOLD} up/dn${NC} server  ${BOLD}PgUp/PgDn${NC} packages  ${BOLD}y${NC} approve  ${BOLD}n${NC} skip  ${BOLD}a${NC} all  ${BOLD}ENTER${NC} apply  ${BOLD}q${NC} cancel%s\n" "$eol"
+    else
+        printf "${BOLD} up/dn${NC} srv ${BOLD}PgUp/Dn${NC} pkgs ${BOLD}y${NC}es ${BOLD}n${NC}o ${BOLD}a${NC}ll ${BOLD}ENTER${NC} apply ${BOLD}q${NC} cancel%s\n" "$eol"
+    fi
+
+    # Erase anything left over from a taller previous frame
+    printf '\033[0J'
+}
+
+# True when the terminal can carry the review screen.
+review_screen_supported() {
+    [[ "$IS_TTY" == true ]] || return 1
+    [[ "$CLASSIC_REVIEW" == false ]] || return 1
+    [[ "$DRY_RUN" == false && "$CHECK_ONLY" == false ]] || return 1
+    [[ "$ASSUME_YES" == false && "$NON_INTERACTIVE" == false ]] || return 1
+    [[ -r /dev/tty ]] || return 1
+
+    get_term_width
+    get_term_height
+    (( TERM_WIDTH >= REVIEW_MIN_WIDTH && TERM_HEIGHT >= REVIEW_MIN_HEIGHT )) || return 1
+
+    return 0
+}
+
+# Run the review screen until the user commits or cancels.
+# Sets REVIEW_RESULT to "commit" or "cancel".
+# Returns 0 when the screen ran, 1 when the keyboard could not be opened
+# (the caller then falls back to the classic prompts).
+run_review_screen() {
+    # Read the keyboard from the controlling terminal, not stdin, so a
+    # redirected stdin cannot answer the review. The brace group keeps bash
+    # from printing its own redirection error; the caller falls back to the
+    # classic prompts.
+    { exec 3</dev/tty; } 2>/dev/null || return 1
+
+    RV_CUR=0; RV_TOP=0; PKG_TOP=0; PKG_CACHE_IDX=-1
+    REVIEW_RESULT="cancel"
+
+    local n=${#RV_SERVER[@]}
+    local i need_draw=1 last_w=0 last_h=0
+
+    printf '\033[?25l\033[2J'
+
+    while true; do
+        (( need_draw )) && draw_review
+        need_draw=1
+
+        if ! read_key; then
+            break   # end of input, treat as cancel
+        fi
+
+        case "$KEY" in
+            TIMEOUT)
+                # Nothing was typed. Repaint only if the window changed size,
+                # so an idle screen costs nothing.
+                last_w=$TERM_WIDTH; last_h=$TERM_HEIGHT
+                get_term_width
+                get_term_height
+                (( TERM_WIDTH == last_w && TERM_HEIGHT == last_h )) && need_draw=0
+                ;;
+            UP|k|K)
+                (( RV_CUR > 0 )) && { (( RV_CUR-- )); PKG_TOP=0; }
+                ;;
+            DOWN|j|J)
+                (( RV_CUR < n - 1 )) && { (( RV_CUR++ )); PKG_TOP=0; }
+                ;;
+            PGUP|LEFT)
+                PKG_TOP=$(( PKG_TOP - PKG_PAGE ))
+                ;;
+            PGDN|RIGHT)
+                PKG_TOP=$(( PKG_TOP + PKG_PAGE ))
+                ;;
+            HOME)
+                PKG_TOP=0
+                ;;
+            END)
+                PKG_TOP=${#PKG_LINES[@]}
+                ;;
+            y|Y)
+                RV_DECISION[$RV_CUR]="yes"
+                (( RV_CUR < n - 1 )) && { (( RV_CUR++ )); PKG_TOP=0; }
+                ;;
+            n|N)
+                RV_DECISION[$RV_CUR]="no"
+                (( RV_CUR < n - 1 )) && { (( RV_CUR++ )); PKG_TOP=0; }
+                ;;
+            ' ')
+                if [[ "${RV_DECISION[$RV_CUR]}" == "yes" ]]; then
+                    RV_DECISION[$RV_CUR]="no"
+                else
+                    RV_DECISION[$RV_CUR]="yes"
+                fi
+                ;;
+            a|A)
+                for i in "${!RV_DECISION[@]}"; do
+                    RV_DECISION[$i]="yes"
+                done
+                ;;
+            ENTER)
+                REVIEW_RESULT="commit"
+                break
+                ;;
+            q|Q|ESC)
+                REVIEW_RESULT="cancel"
+                break
+                ;;
+        esac
+    done
+
+    exec 3<&-
+    printf '\033[?25h\033[0m\033[2J\033[H'
+    return 0
+}
+
+# Print what the review decided. The screen repaints in place, so without this
+# the scrollback keeps no record of the choices.
+print_review_summary() {
+    local i dec label
+
+    echo ""
+    if [[ "$REVIEW_RESULT" == "commit" ]]; then
+        echo -e "${BOLD}${GREEN}Review complete${NC}"
+    else
+        echo -e "${BOLD}${YELLOW}Review cancelled - no updates approved${NC}"
+    fi
+    echo ""
+
+    for i in "${!RV_SERVER[@]}"; do
+        dec="${RV_DECISION[$i]}"
+        [[ "$REVIEW_RESULT" == "commit" && "$dec" == "yes" ]] || dec="no"
+
+        if [[ "$dec" == "yes" ]]; then
+            label="${GREEN}${DEC_YES}${NC}"
+        else
+            label="${YELLOW}${DEC_NO}${NC}"
+        fi
+
+        if [[ "${RV_KUPD[$i]}" == "true" ]]; then
+            echo -e "  ${label} ${RV_NAME[$i]} (${RV_COUNT[$i]} updates, ${YELLOW}kernel - reboot${NC})"
+        else
+            echo -e "  ${label} ${RV_NAME[$i]} (${RV_COUNT[$i]} updates)"
+        fi
+    done
+    echo ""
 }
 
 # Function to check for available updates on a server
@@ -1715,153 +2302,132 @@ sleep 2
 # PHASE 2: Review and approve updates for each server
 # ============================================================================
 # In this phase, we:
-#   1. Display the list of available updates for each server
-#   2. Highlight kernel packages in red (these require reboot)
-#   3. Prompt user to approve or decline updates for each server
+#   1. Collect every server that has updates to review
+#   2. Show the packages, with kernel packages in red (these force a reboot)
+#   3. Let the user approve or skip each server
 #   4. Build a list of approved servers for Phase 3
-# Special modes:
-#   --dry-run: Skip all updates
-#   --check-only: Display updates but don't prompt
-#   --assume-yes: Auto-approve all updates
+#
+# There are two front ends. On a terminal that can carry it, the review screen
+# lists the servers with the decision on the right and the packages for the
+# highlighted server below. Everywhere else, and with --classic-review, the
+# script falls back to one server at a time with the prompt under the packages.
+#
+# Special modes (classic front end only, the screen never opens in them):
+#   --dry-run:         Skip all updates
+#   --check-only:      Display updates but don't prompt
+#   --assume-yes:      Auto-approve all updates
+#   --non-interactive: Skip all prompts, which means skip every server
 # ============================================================================
-# Interactive review state: 'a' approves everything remaining, 'q' stops the review
-APPROVE_ALL=false
-REVIEW_QUIT=false
+collect_review_candidates
 
-for server in "${SERVERS[@]}"; do
-    # Skip local aliases (localhost/127.0.0.1/::1) - handled separately in Phase 4
-    if is_localhost "$server"; then
-        continue
+REVIEW_SCREEN_USED=false
+if (( ${#RV_SERVER[@]} > 0 )) && review_screen_supported; then
+    if run_review_screen; then
+        REVIEW_SCREEN_USED=true
     fi
+fi
 
-    output_file="$TEMP_DIR/${server}.output"
-    status_file="$TEMP_DIR/${server}.status"
+if [[ "$REVIEW_SCREEN_USED" == true ]]; then
+    # ------------------------------------------------------------------
+    # Review screen: apply the decisions it collected
+    # ------------------------------------------------------------------
+    print_review_summary
 
-    # Skip if output file doesn't exist
-    if [[ ! -f "$output_file" ]]; then
-        continue
-    fi
+    for review_idx in "${!RV_SERVER[@]}"; do
+        review_decision="${RV_DECISION[$review_idx]}"
+        [[ "$REVIEW_RESULT" == "commit" ]] || review_decision="no"
+        apply_review_decision "${RV_SERVER[$review_idx]}" "$review_decision"
+    done
+else
+    # ------------------------------------------------------------------
+    # Classic front end: one server at a time
+    # ------------------------------------------------------------------
+    # 'a' approves everything remaining, 'q' stops the review
+    APPROVE_ALL=false
+    REVIEW_QUIT=false
 
-    safe_read_file "$status_file" "Unknown"
-    status="$SRF_RESULT"
+    for review_idx in "${!RV_SERVER[@]}"; do
+        server="${RV_SERVER[$review_idx]}"
+        display_name="${RV_NAME[$review_idx]}"
+        pkg_manager="${RV_PM[$review_idx]}"
 
-    # Skip servers with errors or no updates
-    if [[ "$status" == *"ERROR"* ]] || [[ "$status" == *"No updates"* ]]; then
-        continue
-    fi
-
-    # Verify updates are actually available. dnf/yum previews contain
-    # "Transaction Summary"; apt output starts with "Listing..." -- this gate
-    # previously only knew the dnf format, which silently dropped every apt
-    # server from review (they could never be approved or updated).
-    if ! grep -q -e "Transaction Summary" -e "^Listing" "$output_file"; then
-        continue
-    fi
-
-    # Display server header
-    echo -e "${BOLD}${BLUE}=====================================================================${NC}"
-    display_name=$(get_display_name "$server")
-    echo -e "${BOLD}${GREEN}Server: ${CYAN}$display_name${NC}"
-    echo -e "${BOLD}${BLUE}=====================================================================${NC}"
-    echo ""
-
-    # ========================================
-    # Extract and display package lists from package manager output
-    # Highlight kernel packages in RED BOLD since they require reboot
-    # ========================================
-    # Read package manager from cache (set during check_server_updates)
-    pkg_manager=$(get_pkg_manager "$server")
-
-    case "$pkg_manager" in
-        apt)
-            # For apt, display the upgradeable packages list
-            filter_apt_header "$output_file" | while read -r line; do
-                if has_kernel_package "$line" "apt"; then
-                    echo -e "${RED}${BOLD}$line${NC}"
-                else
-                    echo "$line"
-                fi
-            done
-            echo ""
-            ;;
-        dnf|yum)
-            # One pass over the whole package table: from the first section
-            # header to the Transaction Summary. The header alternation matters
-            # for old distros -- dnf says "Upgrading:" but yum (CentOS 6/7) says
-            # "Updating:", so the old Upgrading-only range showed an EMPTY
-            # package list on yum hosts. A single range also avoids the
-            # duplicated output the old per-section ranges produced when both
-            # Installing: and Upgrading: sections were present.
-            sed -n '/^\(Installing\|Upgrading\|Updating\|Removing\|Downgrading\|Reinstalling\)[^:]*:[[:space:]]*$/,/^Transaction Summary/p' "$output_file" | head -n -1 | while read -r line; do
-                if has_kernel_package "$line" "$pkg_manager"; then
-                    echo -e "${RED}${BOLD}$line${NC}"
-                else
-                    echo "$line"
-                fi
-            done
-
-            # Display transaction summary (total packages, download size, etc.)
-            echo ""
-            sed -n '/^Transaction Summary/,/^Total download size/p' "$output_file"
-            echo ""
-            ;;
-    esac
-
-    # Warn if kernel update detected
-    output_content=$(cat "$output_file")
-    if has_kernel_package "$output_content" "$pkg_manager"; then
-        echo -e "${YELLOW}${BOLD}${GLYPH_WARN} Kernel update detected - server will be rebooted after updates${NC}"
+        # Display server header
+        echo -e "${BOLD}${BLUE}=====================================================================${NC}"
+        echo -e "${BOLD}${GREEN}Server: ${CYAN}$display_name${NC}"
+        echo -e "${BOLD}${BLUE}=====================================================================${NC}"
         echo ""
-    fi
 
-    # ========================================
-    # Prompt for confirmation (or auto-approve based on mode)
-    # ========================================
-    if [[ "$DRY_RUN" == true ]]; then
-        echo -e "${YELLOW}Skipping updates (dry-run mode)${NC}\n"
-        update_status "$server" "Skipped (dry-run)"
-    elif [[ "$CHECK_ONLY" == true ]]; then
-        echo -e "${CYAN}Check-only mode - not prompting for approval${NC}\n"
-        update_status "$server" "Displayed (check-only)"
-    elif [[ "$ASSUME_YES" == true ]]; then
-        echo -e "${GREEN}Auto-approving updates (--assume-yes mode)${NC}\n"
-        echo "$server" >> "$TEMP_DIR/approved_servers.txt"
-    elif [[ "$APPROVE_ALL" == true ]]; then
-        echo -e "${GREEN}Auto-approving updates ('a' selected earlier)${NC}\n"
-        echo "$server" >> "$TEMP_DIR/approved_servers.txt"
-    else
-        # Interactive mode - prompt user
-        echo -e -n "${BOLD}Apply updates to $display_name? [y/N/a=yes to all/q=quit review]: ${NC}"
-        read -r response
+        # Package list, with kernel packages in RED BOLD since they force a reboot
+        render_package_lines "$server" "$pkg_manager" | while IFS= read -r line; do
+            if has_kernel_package "$line" "$pkg_manager"; then
+                echo -e "${RED}${BOLD}$line${NC}"
+            else
+                echo "$line"
+            fi
+        done
+        echo ""
 
-        case "$response" in
-            [Yy])
-                echo -e "${GREEN}Proceeding with updates for $display_name...${NC}\n"
-                echo "$server" >> "$TEMP_DIR/approved_servers.txt"
-                ;;
-            [Aa])
-                APPROVE_ALL=true
-                echo -e "${GREEN}Proceeding with updates for $display_name (and all remaining servers)...${NC}\n"
-                echo "$server" >> "$TEMP_DIR/approved_servers.txt"
-                ;;
-            [Qq])
-                echo -e "${YELLOW}Quitting review - skipping this and all remaining servers${NC}\n"
-                update_status "$server" "Skipped by user"
-                REVIEW_QUIT=true
-                ;;
-            *)
-                echo -e "${YELLOW}Skipping updates for $display_name${NC}\n"
-                update_status "$server" "Skipped by user"
-                ;;
-        esac
-    fi
+        # Warn if kernel update detected
+        if [[ "${RV_KUPD[$review_idx]}" == "true" ]]; then
+            echo -e "${YELLOW}${BOLD}${GLYPH_WARN} Kernel update detected - server will be rebooted after updates${NC}"
+            echo ""
+        fi
 
-    echo ""
+        # ========================================
+        # Prompt for confirmation (or auto-approve based on mode)
+        # ========================================
+        if [[ "$DRY_RUN" == true ]]; then
+            echo -e "${YELLOW}Skipping updates (dry-run mode)${NC}\n"
+            update_status "$server" "Skipped (dry-run)"
+        elif [[ "$CHECK_ONLY" == true ]]; then
+            echo -e "${CYAN}Check-only mode - not prompting for approval${NC}\n"
+            update_status "$server" "Displayed (check-only)"
+        elif [[ "$ASSUME_YES" == true ]]; then
+            echo -e "${GREEN}Auto-approving updates (--assume-yes mode)${NC}\n"
+            apply_review_decision "$server" "yes"
+        elif [[ "$APPROVE_ALL" == true ]]; then
+            echo -e "${GREEN}Auto-approving updates ('a' selected earlier)${NC}\n"
+            apply_review_decision "$server" "yes"
+        elif [[ "$NON_INTERACTIVE" == true ]]; then
+            # --non-interactive promises no prompts. Without --assume-yes there
+            # is nobody to approve, so skip. Phase 4 treats the flag the same way.
+            echo -e "${YELLOW}Skipping updates (--non-interactive without --assume-yes)${NC}\n"
+            apply_review_decision "$server" "no"
+        else
+            # Interactive mode - prompt user
+            echo -e -n "${BOLD}Apply updates to $display_name? [y/N/a=yes to all/q=quit review]: ${NC}"
+            read -r response
 
-    if [[ "$REVIEW_QUIT" == true ]]; then
-        break
-    fi
-done
+            case "$response" in
+                [Yy])
+                    echo -e "${GREEN}Proceeding with updates for $display_name...${NC}\n"
+                    apply_review_decision "$server" "yes"
+                    ;;
+                [Aa])
+                    APPROVE_ALL=true
+                    echo -e "${GREEN}Proceeding with updates for $display_name (and all remaining servers)...${NC}\n"
+                    apply_review_decision "$server" "yes"
+                    ;;
+                [Qq])
+                    echo -e "${YELLOW}Quitting review - skipping this and all remaining servers${NC}\n"
+                    apply_review_decision "$server" "no"
+                    REVIEW_QUIT=true
+                    ;;
+                *)
+                    echo -e "${YELLOW}Skipping updates for $display_name${NC}\n"
+                    apply_review_decision "$server" "no"
+                    ;;
+            esac
+        fi
+
+        echo ""
+
+        if [[ "$REVIEW_QUIT" == true ]]; then
+            break
+        fi
+    done
+fi
+
 
 # ============================================================================
 # PHASE 3: Apply updates to approved servers in parallel

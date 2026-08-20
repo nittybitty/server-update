@@ -12,6 +12,10 @@ test_*.bash
 *_test.bash
 test/
 
+# Agent and tool state
+.claude/
+.commandcode/
+
 # Python virtual environment
 venv/
 
