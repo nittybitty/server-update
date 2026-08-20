@@ -66,6 +66,10 @@ REBOOT_MAX_WAIT=900
 REBOOT_WAIT_INTERVAL=30
 # DASHBOARD_REFRESH: Seconds between dashboard refreshes (default: 1 second)
 DASHBOARD_REFRESH=1
+# DASHBOARD_WIDTH: Force the dashboard table width in columns (40-1000).
+# Empty means auto-detect. Set it when the terminal reports the wrong size,
+# for example an old `tput` that always answers 80.
+DASHBOARD_WIDTH="${DASHBOARD_WIDTH:-}"
 # APPLY_TIMEOUT: Maximum time (seconds) for the actual update run in Phase 3/4
 # (default: 3600 = 1 hour). Separate from DNF_TIMEOUT (the check phase): big
 # updates on old/slow hardware routinely exceed 10 minutes, and killing a
@@ -88,7 +92,7 @@ load_config() {
     fi
 
     # Whitelist of allowed configuration variables
-    local allowed_vars=("DNF_TIMEOUT" "APPLY_TIMEOUT" "KERNEL_PACKAGE_REGEX" "KERNEL_UPDATE_REGEX" "REBOOT_MAX_WAIT" "REBOOT_WAIT_INTERVAL" "DASHBOARD_REFRESH")
+    local allowed_vars=("DNF_TIMEOUT" "APPLY_TIMEOUT" "KERNEL_PACKAGE_REGEX" "KERNEL_UPDATE_REGEX" "REBOOT_MAX_WAIT" "REBOOT_WAIT_INTERVAL" "DASHBOARD_REFRESH" "DASHBOARD_WIDTH")
 
     # Parse config file safely - only allow whitelisted variable assignments.
     # The `|| [[ -n "$key" ]]` guard still processes a final line that lacks a
@@ -110,6 +114,15 @@ load_config() {
                 value="${value#\"}"
                 value="${value%\'}"
                 value="${value#\'}"
+
+                # Validate the dashboard width separately: it is a column
+                # count, not a duration, so the seconds range does not apply
+                if [[ "$key" == "DASHBOARD_WIDTH" ]]; then
+                    if ! [[ "$value" =~ ^[0-9]+$ ]] || [[ "$value" -lt 40 ]] || [[ "$value" -gt 1000 ]]; then
+                        echo -e "${YELLOW}[WARNING]${NC} Invalid value for $key in config file (must be 40-1000). Using auto-detection."
+                        continue
+                    fi
+                fi
 
                 # Validate numeric values
                 if [[ "$key" =~ TIMEOUT|WAIT|REFRESH ]]; then
@@ -985,11 +998,38 @@ parse_dnf_package_count() {
     echo "$dnf_output" | awk '/^(Install|Upgrade|Update)[[:space:]]/ {s+=$2} END {print s+0}'
 }
 
-# Terminal width detection with a safe fallback (old consoles, cron without
-# TERM set). Result in the global TERM_WIDTH.
+# Terminal width detection. Result in the global TERM_WIDTH.
+#
+# Detection order matters. `tput cols` reads the terminfo entry for $TERM and
+# asks the kernel for the real window size only on newer ncurses builds. Older
+# builds (CentOS/RHEL 6 and 7), an unknown $TERM, and a $TERM whose entry has a
+# hardcoded width all return 80 in a 200-column window. `stty size` asks the
+# kernel directly (TIOCGWINSZ) and does not use terminfo, so it goes first.
+# Order: DASHBOARD_WIDTH override, stty on /dev/tty, stty on stderr, tput cols,
+# COLUMNS, then 80.
 get_term_width() {
-    local w
-    w=$(tput cols 2>/dev/null)
+    local w=""
+
+    # Explicit override from server_update.conf or the environment
+    if [[ "${DASHBOARD_WIDTH:-}" =~ ^[0-9]+$ ]] && (( DASHBOARD_WIDTH >= 40 && DASHBOARD_WIDTH <= 1000 )); then
+        TERM_WIDTH=$DASHBOARD_WIDTH
+        return
+    fi
+
+    # stty prints "rows cols"; keep the last field. /dev/tty is the controlling
+    # terminal even when stdout is a pipe (which is what happens inside every
+    # command substitution, and is why tput can miss the size).
+    w=$(stty size 2>/dev/null </dev/tty); w="${w##* }"
+    if ! [[ "$w" =~ ^[0-9]+$ ]] || (( w < 40 )); then
+        w=$(stty size 2>/dev/null <&2); w="${w##* }"
+    fi
+    if ! [[ "$w" =~ ^[0-9]+$ ]] || (( w < 40 )); then
+        w=$(tput cols 2>/dev/null)
+    fi
+    if ! [[ "$w" =~ ^[0-9]+$ ]] || (( w < 40 )); then
+        w="${COLUMNS:-}"
+    fi
+
     if [[ "$w" =~ ^[0-9]+$ ]] && (( w >= 40 )); then
         TERM_WIDTH=$w
     else
@@ -997,25 +1037,68 @@ get_term_width() {
     fi
 }
 
-# Pick column widths that fit the terminal. Old-distro consoles, serial lines,
-# and default PuTTY windows are 80 columns; the previous fixed 133-wide layout
-# wrapped every row there and turned the refresh into unreadable churn.
-# Parameters: $1 = terminal width
+# Column headers, the smallest width each column can drop to, and the widest
+# it can grow to once the table has to compete for room.
+readonly HDR_SRV="SERVER" HDR_OS="OS DISTRIBUTION" HDR_KRN="KERNEL VERSION" HDR_STS="STATUS"
+readonly MIN_COL_SRV=16 MIN_COL_OS=8 MIN_COL_KRN=8 MIN_COL_STS=16
+readonly MAX_COL_SRV=44 MAX_COL_STS=60
+# How much wider than the OS and kernel columns the status column stays when
+# the table has to give up room.
+readonly STS_BONUS=8
+
+# Size the columns from the data instead of from a fixed table. Every column
+# starts at its natural width (the longest value it must show). If the row fits
+# the terminal, nothing is cut and the spare room goes to the status column.
+# Parameters: $1 = terminal width, $2-$5 = natural width of each column
 # Side effects: sets COL_SRV, COL_OS, COL_KRN, COL_STS globals
 compute_dashboard_layout() {
     local w="$1"
-    if (( w >= 133 )); then
-        COL_SRV=30; COL_OS=32; COL_KRN=28
-    elif (( w >= 110 )); then
-        COL_SRV=26; COL_OS=24; COL_KRN=22
-    elif (( w >= 92 )); then
-        COL_SRV=22; COL_OS=20; COL_KRN=16
-    else
-        COL_SRV=20; COL_OS=16; COL_KRN=12
+    COL_SRV="$2"; COL_OS="$3"; COL_KRN="$4"; COL_STS="$5"
+
+    local avail=$((w - 3))   # three single-space column separators
+    local over=$(( COL_SRV + COL_OS + COL_KRN + COL_STS - avail ))
+
+    if (( over <= 0 )); then
+        # Spare room goes to the status column, so long messages stay whole
+        COL_STS=$(( COL_STS - over ))
+        return
     fi
-    COL_STS=$((w - COL_SRV - COL_OS - COL_KRN - 3))
-    (( COL_STS > 45 )) && COL_STS=45
-    (( COL_STS < 12 )) && COL_STS=12
+
+    # The row does not fit. Cap the two columns that can run very long, so a
+    # single huge value cannot take the whole row.
+    (( COL_SRV > MAX_COL_SRV )) && COL_SRV=$MAX_COL_SRV
+    (( COL_STS > MAX_COL_STS )) && COL_STS=$MAX_COL_STS
+    over=$(( COL_SRV + COL_OS + COL_KRN + COL_STS - avail ))
+    if (( over <= 0 )); then
+        COL_STS=$(( COL_STS - over ))
+        return
+    fi
+
+    # Take the rest one character at a time from whichever secondary column is
+    # currently the widest, which keeps the three balanced. Status counts as
+    # STS_BONUS narrower than it is, so it stays the widest of the three. The
+    # server column is the last to give up room: its "address (nickname)"
+    # label is what identifies the row.
+    local sts_eff
+    while (( over > 0 )); do
+        sts_eff=$(( COL_STS - STS_BONUS ))
+        if (( COL_STS > MIN_COL_STS && sts_eff >= COL_OS && sts_eff >= COL_KRN )); then
+            (( COL_STS-- ))
+        elif (( COL_OS > MIN_COL_OS && COL_OS >= COL_KRN )); then
+            (( COL_OS-- ))
+        elif (( COL_KRN > MIN_COL_KRN )); then
+            (( COL_KRN-- ))
+        elif (( COL_OS > MIN_COL_OS )); then
+            (( COL_OS-- ))
+        elif (( COL_STS > MIN_COL_STS )); then
+            (( COL_STS-- ))
+        elif (( COL_SRV > MIN_COL_SRV )); then
+            (( COL_SRV-- ))
+        else
+            break   # narrower than the table can go; rows wrap from here
+        fi
+        (( over-- ))
+    done
 }
 
 # Truncate $1 to $2 characters with a "..." marker. Result in the global
@@ -1032,8 +1115,10 @@ truncate_field() {
 # Function to draw the live-updating dashboard showing all server statuses
 # Repaints in place: cursor-home plus erase-to-end-of-line per row (\033[K)
 # instead of a full-screen clear, so the 1s refresh doesn't flicker on slow
-# terminals. Width-aware: columns scale down to fit 80-column consoles. When
-# stdout is not a tty (cron/pipes) it prints a plain table, no escape codes.
+# terminals. The table sizes itself to the data and to the terminal: it reads
+# every row first, measures the longest value per column, then gives each
+# column the width it needs. When stdout is not a tty (cron/pipes) it prints a
+# plain table, no escape codes.
 # Status is read from temporary status files written by update_status()
 # No parameters required - reads from global SERVERS array
 draw_dashboard() {
@@ -1044,7 +1129,56 @@ draw_dashboard() {
     fi
 
     get_term_width
-    compute_dashboard_layout "$TERM_WIDTH"
+
+    # Pass 1: read the state of every server and measure the columns.
+    local row_srv=() row_os=() row_krn=() row_sts=() row_color=()
+    local nat_srv=${#HDR_SRV} nat_os=${#HDR_OS} nat_krn=${#HDR_KRN} nat_sts=${#HDR_STS}
+    local n_active=0 n_updates=0 n_done=0 n_err=0
+    local server status display_name os_info kernel_info color
+
+    for server in "${SERVERS[@]}"; do
+        safe_read_file "$TEMP_DIR/${server}.status" "Pending"
+        status="$SRF_RESULT"
+
+        # Color code status based on keywords, and tally for the footer
+        case "$status" in
+            *"ERROR"*|*"Error"*) color="${RED}"; ((n_err++)) ;;
+            *"updates available"*) color="${YELLOW}"; ((n_updates++)) ;;
+            *"No updates"*) color="${GREEN}"; ((n_done++)) ;;
+            *"Reboot complete"*|*"Successfully rebooted"*) color="${GREEN}"; ((n_done++)) ;;
+            *"Complete"*) color="${GREEN}"; ((n_done++)) ;;
+            *"Skipped"*|*"Displayed"*) color="${YELLOW}"; ((n_done++)) ;;
+            *"Updating"*|*"Applying"*) color="${MAGENTA}"; ((n_active++)) ;;
+            *"Rebooting"*) color="${YELLOW}"; ((n_active++)) ;;
+            *"Connected"*) color="${GREEN}"; ((n_active++)) ;;
+            *) color="${CYAN}"; ((n_active++)) ;;
+        esac
+
+        display_name=$(get_display_name "$server")
+
+        # Get OS and kernel info from temp files
+        safe_read_file "$TEMP_DIR/${server}.os_release" "--"
+        os_info="$SRF_RESULT"
+        safe_read_file "$TEMP_DIR/${server}.kernel" "--"
+        kernel_info="$SRF_RESULT"
+
+        # Don't show "Unknown"
+        [[ "$os_info" == "Unknown" ]] && os_info="--"
+        [[ "$kernel_info" == "Unknown" ]] && kernel_info="--"
+
+        row_srv+=("$display_name")
+        row_os+=("$os_info")
+        row_krn+=("$kernel_info")
+        row_sts+=("$status")
+        row_color+=("$color")
+
+        (( ${#display_name} > nat_srv )) && nat_srv=${#display_name}
+        (( ${#os_info}     > nat_os  )) && nat_os=${#os_info}
+        (( ${#kernel_info} > nat_krn )) && nat_krn=${#kernel_info}
+        (( ${#status}      > nat_sts )) && nat_sts=${#status}
+    done
+
+    compute_dashboard_layout "$TERM_WIDTH" "$nat_srv" "$nat_os" "$nat_krn" "$nat_sts"
 
     # Header banner sized to the terminal
     local box sep title pad
@@ -1059,59 +1193,30 @@ draw_dashboard() {
     printf "${BOLD}${BLUE}%*s%s${NC}%s\n" "$pad" '' "$title" "$eol"
     echo -e "${BOLD}${BLUE}${box}${NC}${eol}"
 
-    # Column headers
+    # Column headers. Narrow columns get the short label instead of a
+    # truncated one.
+    local h_srv="$HDR_SRV" h_os="$HDR_OS" h_krn="$HDR_KRN" h_sts="$HDR_STS"
+    (( COL_OS  < ${#HDR_OS}  )) && h_os="OS"
+    (( COL_KRN < ${#HDR_KRN} )) && h_krn="KERNEL"
+    truncate_field "$h_os" "$COL_OS"; h_os="$TRUNC_RESULT"
+    truncate_field "$h_krn" "$COL_KRN"; h_krn="$TRUNC_RESULT"
+
     printf "%s\n" "$eol"
-    printf "${BOLD}%-*s %-*s %-*s %-*s${NC}%s\n" \
-        "$COL_SRV" "SERVER" "$COL_OS" "OS DISTRIBUTION" "$COL_KRN" "KERNEL VERSION" "$COL_STS" "STATUS" "$eol"
+    printf "${BOLD}%-*s %-*s %-*s %s${NC}%s\n" \
+        "$COL_SRV" "$h_srv" "$COL_OS" "$h_os" "$COL_KRN" "$h_krn" "$h_sts" "$eol"
     echo -e "${BLUE}${sep}${NC}${eol}"
 
-    # Tallies for the summary footer
-    local n_active=0 n_updates=0 n_done=0 n_err=0
+    # Pass 2: print one line per server
+    local i
+    for i in "${!row_srv[@]}"; do
+        truncate_field "${row_srv[$i]}" "$COL_SRV"; display_name="$TRUNC_RESULT"
+        truncate_field "${row_os[$i]}" "$COL_OS"; os_info="$TRUNC_RESULT"
+        truncate_field "${row_krn[$i]}" "$COL_KRN"; kernel_info="$TRUNC_RESULT"
+        truncate_field "${row_sts[$i]}" "$COL_STS"; status="$TRUNC_RESULT"
 
-    # Display status for each server
-    local server
-    for server in "${SERVERS[@]}"; do
-        local status
-        safe_read_file "$TEMP_DIR/${server}.status" "Pending"
-        status="$SRF_RESULT"
-
-        # Color code status based on keywords, and tally for the footer
-        local color="${CYAN}"
-        case "$status" in
-            *"ERROR"*|*"Error"*) color="${RED}"; ((n_err++)) ;;
-            *"updates available"*) color="${YELLOW}"; ((n_updates++)) ;;
-            *"No updates"*) color="${GREEN}"; ((n_done++)) ;;
-            *"Reboot complete"*|*"Successfully rebooted"*) color="${GREEN}"; ((n_done++)) ;;
-            *"Complete"*) color="${GREEN}"; ((n_done++)) ;;
-            *"Skipped"*|*"Displayed"*) color="${YELLOW}"; ((n_done++)) ;;
-            *"Updating"*|*"Applying"*) color="${MAGENTA}"; ((n_active++)) ;;
-            *"Rebooting"*) color="${YELLOW}"; ((n_active++)) ;;
-            *"Connected"*) color="${GREEN}"; ((n_active++)) ;;
-            *) color="${CYAN}"; ((n_active++)) ;;
-        esac
-
-        local display_name os_info kernel_info
-        display_name=$(get_display_name "$server")
-
-        # Get OS and kernel info from temp files
-        safe_read_file "$TEMP_DIR/${server}.os_release" "--"
-        os_info="$SRF_RESULT"
-        safe_read_file "$TEMP_DIR/${server}.kernel" "--"
-        kernel_info="$SRF_RESULT"
-
-        # Don't show "Unknown"
-        [[ "$os_info" == "Unknown" ]] && os_info="--"
-        [[ "$kernel_info" == "Unknown" ]] && kernel_info="--"
-
-        # Truncate fields to the computed column widths
-        truncate_field "$display_name" "$COL_SRV"; display_name="$TRUNC_RESULT"
-        truncate_field "$os_info" "$COL_OS"; os_info="$TRUNC_RESULT"
-        truncate_field "$kernel_info" "$COL_KRN"; kernel_info="$TRUNC_RESULT"
-        truncate_field "$status" "$COL_STS"; status="$TRUNC_RESULT"
-
-        # Display single line with all info
-        printf "%-*s %-*s %-*s ${color}%-*s${NC}%s\n" \
-            "$COL_SRV" "$display_name" "$COL_OS" "$os_info" "$COL_KRN" "$kernel_info" "$COL_STS" "$status" "$eol"
+        # The status column is last, so it is printed unpadded
+        printf "%-*s %-*s %-*s ${row_color[$i]}%s${NC}%s\n" \
+            "$COL_SRV" "$display_name" "$COL_OS" "$os_info" "$COL_KRN" "$kernel_info" "$status" "$eol"
     done
 
     echo -e "${BLUE}${sep}${NC}${eol}"

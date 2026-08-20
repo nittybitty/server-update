@@ -36,7 +36,11 @@ The dashboard displays:
 
 Rendering details:
 - **Flicker-free**: repaints in place instead of clearing the screen each frame
-- **Width-aware**: column widths adapt to the terminal, down to 80 columns (serial consoles, default PuTTY windows)
+- **Self-sizing columns**: each column is measured from the data, so the full `address (nickname)` label stays
+  visible. The table shrinks the OS, kernel, and status columns first when the terminal is narrow (serial
+  consoles, default PuTTY windows)
+- **Width detection**: the width comes from `stty size` first, then `tput cols`, then `COLUMNS`. Old `tput`
+  builds report the terminfo default of 80 in a wider window. To force a width, set `DASHBOARD_WIDTH`
 - **Terminal-friendly**: UTF-8 symbols (`✓ ✗ ⚠`) fall back to ASCII (`[OK] [X] [!]`) on non-UTF-8 locales
 - **Automation-friendly**: when output is not a terminal (cron, pipes), the live loop is skipped and one plain table is printed; setting `NO_COLOR` disables colors everywhere
 - SSH failures show a classified reason (auth failed, DNS lookup failed, connection refused, host key changed, timed out) instead of a bare "connection failed"
@@ -165,6 +169,10 @@ APPLY_TIMEOUT=3600
 # Dashboard refresh rate (seconds)
 DASHBOARD_REFRESH=1
 
+# Dashboard table width in columns (40-1000). Leave it out for auto-detection.
+# Set it if the terminal reports the wrong size.
+#DASHBOARD_WIDTH=160
+
 # Reboot monitoring settings
 REBOOT_MAX_WAIT=900           # Maximum wait time (15 minutes)
 REBOOT_WAIT_INTERVAL=30       # Check interval (30 seconds)
@@ -181,6 +189,7 @@ KERNEL_UPDATE_REGEX="(Installing|Upgrading).*(kernel-core|kernel-modules|kernel)
 | `DNF_TIMEOUT` | 600 | Timeout for the update check phase (seconds) |
 | `APPLY_TIMEOUT` | 3600 | Timeout for applying updates in Phase 3/4 (seconds) |
 | `DASHBOARD_REFRESH` | 1 | Dashboard update interval (seconds) |
+| `DASHBOARD_WIDTH` | auto | Force the dashboard width in columns (40-1000). Also accepted as an environment variable |
 | `REBOOT_MAX_WAIT` | 900 | Maximum time to wait for reboot (15 minutes) |
 | `REBOOT_WAIT_INTERVAL` | 30 | Seconds between reboot checks |
 | `KERNEL_PACKAGE_REGEX` | See above | Pattern to detect kernel packages (dnf/yum) |
@@ -488,6 +497,22 @@ The script automatically detects and supports:
 - Check if the server actually rebooted (may have hung)
 - Verify SSH service starts automatically on boot
 - Check firewall rules aren't blocking SSH after reboot
+
+### Dashboard stops at 80 columns in a wider window
+The script asks the kernel for the window size with `stty size`, and falls back to `tput cols` and `COLUMNS`.
+Old `tput` builds (CentOS/RHEL 6 and 7) and an unknown `TERM` answer 80 columns whatever the real size is.
+
+1. Confirm what the server sees. Run `stty size` and `tput cols` in the same session.
+2. If `stty size` reports the correct width, the fix is already in the script. Update to this version.
+3. If `stty size` also reports 80, the terminal never sent the window size. Resize the window once to make the
+   client send `SIGWINCH`, or export a correct `TERM` (for example `export TERM=xterm-256color`).
+4. To force a width, set `DASHBOARD_WIDTH` in `server_update.conf`, or run
+   `DASHBOARD_WIDTH=180 ./server_update.bash`.
+
+### Server name is cut off in the dashboard
+The server column is sized from the longest `address (nickname)` label, up to 44 characters. A label is
+truncated only when the terminal is too narrow for the whole table. Widen the window, shorten the nickname,
+or set `DASHBOARD_WIDTH`.
 
 ### Dashboard not updating
 - Adjust `DASHBOARD_REFRESH` if updates seem too fast/slow

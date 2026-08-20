@@ -237,12 +237,33 @@ The `draw_dashboard()` function renders the live status display in a **compact t
   the script just `wait`s and prints one final plain table with no escape
   codes. Colors are also disabled when stdout isn't a tty or `NO_COLOR` is set
 
-**Width-aware layout** (`get_term_width()` + `compute_dashboard_layout()`):
-- Terminal width read via `tput cols` each frame (fallback 80)
-- Column widths scale in tiers: full 30/32/28/40 at ≥133 cols, down to
-  20/16/12/status at 80 cols — old-distro consoles, serial lines, and default
-  PuTTY windows are 80 columns, where the old fixed 133-wide layout wrapped
-  every row
+**Width detection** (`get_term_width()`, result in `TERM_WIDTH`):
+- Order: `DASHBOARD_WIDTH` override → `stty size </dev/tty` → `stty size <&2`
+  → `tput cols` → `COLUMNS` → 80
+- `stty` comes first because it asks the kernel (TIOCGWINSZ) and does not read
+  terminfo. `tput cols` returns the terminfo default (80) for an unknown
+  `TERM`, for a `TERM` entry with a fixed width, and on old ncurses builds
+  when stdout is a pipe — which is what a command substitution gives it. That
+  is the "stuck at 80 columns in a 200-column window" report
+- `/dev/tty` is the controlling terminal, so detection also survives a
+  redirected stdin or stderr. Without a controlling terminal (cron) every
+  source fails and the fallback 80 applies
+- `DASHBOARD_WIDTH` (configuration file or environment, 40–1000) forces a
+  width when the terminal cannot report one
+
+**Data-driven layout** (`compute_dashboard_layout()`):
+- `draw_dashboard()` reads every row first, measures the longest value per
+  column, then sizes the columns. There are no fixed width tiers
+- If the row fits, no value is cut and the spare room goes to STATUS
+- If the row does not fit, SERVER is capped at `MAX_COL_SRV` (44) and STATUS
+  at `MAX_COL_STS` (60), then the overflow is taken one character at a time
+  from whichever of OS/KERNEL/STATUS is the widest. STATUS counts as
+  `STS_BONUS` (8) narrower than it is, so it stays the widest of the three
+- SERVER shrinks last, and only after OS/KERNEL/STATUS reach `MIN_COL_*`
+  (16/8/8/16). The `address (nickname)` label is what identifies the row, so
+  it keeps its full width as long as the terminal allows
+- Narrow columns get short headers (`OS`, `KERNEL`) instead of truncated ones
+- STATUS is the last column, so it is printed unpadded
 - Long values truncated with "..." via `truncate_field()` (global-return,
   fork-free, same pattern as `safe_read_file`)
 
@@ -375,6 +396,7 @@ Optional file with whitelisted variables:
 DNF_TIMEOUT=600                    # Update *check* command timeout (seconds)
 APPLY_TIMEOUT=3600                 # Update *apply* timeout, Phase 3/4 (seconds)
 DASHBOARD_REFRESH=1                # Dashboard update interval (seconds)
+DASHBOARD_WIDTH=160                # Force dashboard width, 40-1000 (default: auto)
 REBOOT_MAX_WAIT=900                # Maximum reboot wait time (seconds)
 REBOOT_WAIT_INTERVAL=30            # Seconds between reboot checks
 KERNEL_PACKAGE_REGEX="..."         # Kernel detection (dnf/yum only)
@@ -419,6 +441,7 @@ Validation performed during parsing (loop at ~line 562):
 
 ### Safe Configuration Loading (`load_config()`, lines ~77-166)
 - Whitelisted variables only (`DNF_TIMEOUT`, `APPLY_TIMEOUT`, `DASHBOARD_REFRESH`,
+  `DASHBOARD_WIDTH`,
   `REBOOT_MAX_WAIT`, `REBOOT_WAIT_INTERVAL`, `KERNEL_PACKAGE_REGEX`,
   `KERNEL_UPDATE_REGEX`)
 - Numeric values validated: digits only, minimum 1 (0 would busy-loop the
@@ -534,7 +557,7 @@ Validation performed during parsing (loop at ~line 562):
 
 ### Main Functions
 
-- `get_term_width()` / `compute_dashboard_layout()` / `truncate_field()` (~lines 990-1037): Width-aware column layout helpers
+- `get_term_width()` / `compute_dashboard_layout()` / `truncate_field()` (~lines 988-1090): Width detection and data-driven column layout
 - `draw_dashboard()` (~line 1039): Renders live status display
 - `update_status(server, status)` (~line 1131): Writes status to temp file using `safe_write_file()`
 - `check_server_updates(server)` (~line 1142): Phase 1 - check for updates
@@ -577,6 +600,11 @@ Effective controller matrix:
 ### Adjusting Dashboard Refresh Rate
 Set `DASHBOARD_REFRESH` in `server_update.conf`. Default is 1 second.
 
+### Forcing the Dashboard Width
+Set `DASHBOARD_WIDTH` (40–1000) in `server_update.conf`, or pass it in the
+environment: `DASHBOARD_WIDTH=180 ./server_update.bash`. Use it when the
+terminal reports the wrong width. Default is auto-detection.
+
 ### Adjusting Reboot Monitoring
 In `server_update.conf`:
 - `REBOOT_MAX_WAIT`: Total time to wait (default: 900s = 15 minutes)
@@ -608,6 +636,23 @@ Log file created with 600 permissions. Warns if log exceeds 10MB.
 ## Version History
 
 ### Unreleased (post-1.4)
+
+**Dashboard width and column fixes (2026-08 review):**
+- **Width detection no longer trusts `tput` alone**: `get_term_width()` now
+  tries `stty size` on `/dev/tty` first, then `stty size` on stderr, then
+  `tput cols`, then `COLUMNS`, then 80. `tput cols` reads terminfo and answers
+  80 for an unknown `TERM`, for entries with a fixed width, and on old ncurses
+  builds when stdout is a pipe (every command substitution), which pinned the
+  dashboard to 80 columns in much wider windows
+- **`DASHBOARD_WIDTH` override**: config file or environment variable, 40–1000,
+  for terminals that cannot report a width at all
+- **Columns are measured from the data**: the fixed 30/32/28 width tiers are
+  gone. `draw_dashboard()` reads all rows first, then sizes each column to its
+  longest value. The full `address (nickname)` label now stays visible instead
+  of being cut at 30 characters, and spare room goes to STATUS
+- **Balanced shrinking when the row does not fit**: overflow comes off
+  OS/KERNEL/STATUS one character at a time, widest first, and SERVER shrinks
+  last. Narrow columns get short headers (`OS`, `KERNEL`)
 
 **Correctness fixes (2026-07 review):**
 - **apt servers restored to Phase 2**: the review gate only recognized the
