@@ -738,6 +738,64 @@ Log file created with 600 permissions. Warns if log exceeds 10MB.
 
 ### Unreleased (post-1.4)
 
+**External audit fixes (2026-08-25):**
+- **Ctrl-C now stops the run.** `trap cleanup EXIT INT TERM` had no `exit`, and
+  a bash trap handler returns to the point of interruption — so an interrupted
+  run cleaned up and then continued through the remaining phases, printing
+  "Update check complete" and a results summary for a job the user had
+  cancelled. Worse, `cleanup()` had already removed `$LOCK_FILE`, so a second
+  instance could start while the first was still working. Traps are now split:
+  `trap 'cleanup; exit 130' INT TERM` plus `trap cleanup EXIT`. `cleanup()`
+  carries a `CLEANUP_DONE` guard so the two traps cannot run it twice
+- **Phase 3 background jobs get `< /dev/null`.** `apply_updates "$server" &`
+  ran inside `while read ... done < approved_servers.txt`, so every job
+  inherited the loop's stdin — the *same open file description* on the approved
+  list. `apply_updates()` calls `ssh` without `-n`, which reads stdin to
+  forward it, so a child could consume the unread remainder and the parent's
+  next `read` hit EOF. Approved servers were then silently never updated.
+  Measured on a 50-line list: 16 of 50 servers dropped; on 400 lines, 396
+  dropped. Small lists usually won the race, which is why this went unnoticed
+- **yum hosts with no updates are no longer errors.** dnf prints
+  `Nothing to do.`; yum 3.x (the RHEL/CentOS 6-7 targets v1.4 restored) prints
+  `No Packages marked for Update` and *no* Transaction Summary. That wording
+  matched neither branch, so a fully patched CentOS 6/7 box reported
+  `ERROR: Failed to check updates`, dropped out of review, and inflated the
+  error tally. The clean branch now matches both wordings, case-insensitively
+- **Empty `KERNEL_*_REGEX` values rejected.** An empty pattern is
+  syntactically valid and matches *every* input in both engines the script uses
+  (`[[ =~ ]]` and `grep -E`), so `load_config()`'s syntax check waved it
+  through. An empty `KERNEL_UPDATE_REGEX` classified every dnf/yum run as a
+  kernel update and rebooted every server in the list. A bare `KEY=` is the
+  obvious way in; an unquoted value containing an apostrophe is the subtle one
+  (the `xargs` round-trip fails on the unmatched quote and yields an empty
+  string). Empty and whitespace-only values are now rejected before the syntax
+  check, keeping the built-in default
+- **apt update counts anchored to the listing format.** The count was a bare
+  `grep -c "/"`. The check command is
+  `apt-get update -qq && apt list --upgradable`, and `execute_remote_command`
+  merges stderr — so when the cache refresh failed, the `&&` short-circuited
+  and the error chatter (`Err:1 http://...`, `E: Failed to fetch http://...`)
+  was counted as upgradeable packages. A host with a dead mirror reported a
+  phantom "N updates available", then vanished from review because the Phase 2
+  gate needs `^Listing`. The count now requires a `/` inside the *first*
+  whitespace-delimited field, which matches apt's `name/suite version arch`
+  rows and no apt error line. Zero packages plus a non-zero exit status is now
+  reported as an error instead of "No updates"
+- **Reboot-in-progress rows are yellow again.** `apply_updates()` sets
+  "Updates complete - kernel updated - initiating reboot...". The dashboard
+  tests `*"Complete"*`, which is case-sensitive, so the row fell through to the
+  default cyan bucket during the whole reboot window. An explicit
+  `*"initiating reboot"*` branch is placed *before* `*"Complete"*` — otherwise
+  a capitalisation would colour an in-progress reboot as done
+
+Audit items deliberately **not** taken: the claim that `server_list.txt` is
+committed is false (`git ls-files` and `git log --all` both show only
+`server_list.txt.example`; the real list was never tracked). The `xargs`
+value-normalisation and inline-comment findings are real but low impact — the
+shipped conf quotes every value, and the dangerous outcome of both is the empty
+regex, now rejected. The `/tmp` lock-file DoS assumes a non-root user; this
+tool runs as root, which can unlink any file in a sticky directory.
+
 **Interactive review screen (2026-08):**
 - **Phase 2 is now a split screen** on any terminal that can carry it: a server
   list where each row carries its own DECISION column, plus a scrolling package

@@ -146,6 +146,20 @@ load_config() {
 
                 # Validate regex patterns with ReDoS protection
                 if [[ "$key" =~ REGEX ]]; then
+                    # Reject an empty pattern BEFORE the syntax check: an empty
+                    # regex is syntactically valid and matches EVERY input in
+                    # both engines this script uses ([[ =~ ]] and grep -E), so
+                    # the syntax check waves it through. An empty
+                    # KERNEL_UPDATE_REGEX would classify every dnf/yum run as a
+                    # kernel update and reboot every server in the list. A bare
+                    # `KEY=` is the obvious way to get here; an unquoted value
+                    # containing an apostrophe is the subtle one (the xargs
+                    # round-trip above fails on the unmatched quote and yields
+                    # an empty string).
+                    if [[ -z "${value//[[:space:]]/}" ]]; then
+                        echo -e "${YELLOW}[WARNING]${NC} Empty regex pattern for $key in config file (an empty pattern matches everything). Using default."
+                        continue
+                    fi
                     # Test regex with timeout to prevent catastrophic backtracking.
                     # The pattern is passed as an argument (never interpolated into
                     # a shell string), so config values cannot inject commands here.
@@ -501,7 +515,13 @@ done
 
 
 # Cleanup function to run on exit
+CLEANUP_DONE=false
 cleanup() {
+    # Run once. The INT/TERM handler calls cleanup and then exits, which fires
+    # the EXIT trap and would otherwise run the whole body a second time.
+    [[ "$CLEANUP_DONE" == true ]] && return 0
+    CLEANUP_DONE=true
+
     # Restore the cursor and clear any leftover attribute (the review screen
     # draws the selected row in reverse video, so Ctrl-C mid-frame would
     # otherwise leave the terminal inverted).
@@ -539,8 +559,17 @@ cleanup() {
     rm -f "$LOCK_FILE"
 }
 
-# Cleanup on exit - kill background jobs and remove temporary directory
-trap cleanup EXIT INT TERM
+# Cleanup on exit - kill background jobs and remove temporary directory.
+#
+# INT/TERM must exit, not just clean up. A bash trap handler returns to the
+# point of interruption, so a single `trap cleanup EXIT INT TERM` let Ctrl-C
+# run cleanup() and then CONTINUE into the following phases: the run printed
+# "Update check complete" and a results summary for a job the user cancelled,
+# and -- worse -- cleanup() had already removed $LOCK_FILE, so a second
+# instance could start while this one was still working.
+# 130 = 128 + SIGINT, the conventional shell status for an interrupted run.
+trap 'cleanup; exit 130' INT TERM
+trap cleanup EXIT
 
 # Initialize log file with restricted permissions (600 - owner read/write only)
 touch "$LOG_FILE" 2>/dev/null
@@ -1259,6 +1288,15 @@ draw_dashboard() {
             *"updates available"*) color="${YELLOW}"; ((n_updates++)) ;;
             *"No updates"*) color="${GREEN}"; ((n_done++)) ;;
             *"Reboot complete"*|*"Successfully rebooted"*) color="${GREEN}"; ((n_done++)) ;;
+            # apply_updates() sets "Updates complete - kernel updated -
+            # initiating reboot...". That is a reboot in progress, not a
+            # finished server, so it belongs with the yellow reboot states; it
+            # reached the default cyan bucket instead.
+            # Keep this branch above *"Complete"* even though that pattern
+            # cannot match the status as written: the two differ only in the
+            # case of one letter, so capitalising the status string would
+            # otherwise start colouring an in-progress reboot as "done".
+            *"initiating reboot"*) color="${YELLOW}"; ((n_active++)) ;;
             *"Complete"*) color="${GREEN}"; ((n_done++)) ;;
             *"Skipped"*|*"Displayed"*) color="${YELLOW}"; ((n_done++)) ;;
             *"Updating"*|*"Applying"*) color="${MAGENTA}"; ((n_active++)) ;;
@@ -1929,13 +1967,34 @@ check_server_updates() {
     local total_count=0
     case "$pkg_manager" in
         apt)
-            # Count upgradeable packages (excluding the "Listing..." header) (Fix: Issue #29)
+            # Count only lines in apt's actual listing format:
+            #   name/suite version arch [upgradable from: ...]
+            # The old count was a bare `grep -c "/"`. The check command is
+            # `apt-get update -qq && apt list --upgradable`, and
+            # execute_remote_command merges stderr. When apt-get update fails
+            # (dead mirror, expired key) the && short-circuits and apt list
+            # never runs, but the error chatter still lands in pkg_output --
+            # "Err:1 http://...", "E: Failed to fetch http://..." -- and every
+            # one of those lines contains a "/". A host with broken apt
+            # therefore reported a phantom "N updates available".
+            # The anchored pattern requires a "/" inside the FIRST whitespace-
+            # delimited field, which no apt error line has ("Err:1", "E:" and
+            # "W:" all put their URL in a later field, and continuation lines
+            # are indented). It also drops the "Listing..." header on its own,
+            # so filter_apt_header is not needed here.
             # No `|| echo 0` here: grep -c already prints 0 on no match, and the
             # fallback produced a second "0" line that broke the -gt comparison
-            total_count=$(echo "$pkg_output" | filter_apt_header | grep -c "/")
+            total_count=$(echo "$pkg_output" | grep -cE '^[^[:space:]/]+/[^[:space:]]+[[:space:]]')
             if [[ $total_count -gt 0 ]]; then
                 update_status "$server" "${total_count} updates available"
                 return 0
+            elif [[ $pkg_exit_code -ne 0 ]]; then
+                # Zero packages AND a failed command is a broken cache refresh,
+                # not a clean host. Reporting "No updates" here would hide it.
+                update_status "$server" "ERROR: Package manager command failed"
+                echo "$(date) - ERROR: apt check failed on $server (exit code: $pkg_exit_code, no package listing)" >> "$LOG_FILE"
+                echo "$pkg_output" >> "$LOG_FILE"
+                return 1
             else
                 update_status "$server" "No updates available - Complete"
                 return 0
@@ -1947,7 +2006,13 @@ check_server_updates() {
                 total_count=$(parse_dnf_package_count "$pkg_output")
                 update_status "$server" "${total_count} updates available"
                 return 0
-            elif echo "$pkg_output" | grep -q "Nothing to do"; then
+            elif echo "$pkg_output" | grep -qiE "nothing to do|no packages marked for update"; then
+                # Two wordings, one meaning. dnf prints "Nothing to do."; yum 3.x
+                # (the RHEL/CentOS 6-7 hosts this release targets) prints
+                # "No Packages marked for Update" and NO Transaction Summary.
+                # The yum wording matched neither branch, so a fully patched
+                # CentOS 6/7 box reported "ERROR: Failed to check updates",
+                # dropped out of review, and inflated the error tally.
                 update_status "$server" "No updates available - Complete"
                 return 0
             else
@@ -2449,7 +2514,13 @@ if [[ -f "$TEMP_DIR/approved_servers.txt" ]]; then
         if is_localhost "$server"; then
             continue
         fi
-        apply_updates "$server" &
+        # < /dev/null is required, not decorative. Without it every background
+        # job inherits this loop's stdin -- the SAME open file description on
+        # approved_servers.txt. apply_updates() calls ssh (no -n), which reads
+        # stdin to forward it, so a child can consume the unread remainder of
+        # the list. The parent's next read then hits EOF and the remaining
+        # approved servers are silently never updated.
+        apply_updates "$server" < /dev/null &
     done < "$TEMP_DIR/approved_servers.txt"
 
     # Wait for all update processes to complete with live dashboard
