@@ -900,7 +900,11 @@ get_ssh_cmd() {
     # and SSH_HOSTKEY_OPT degrades accept-new -> no on pre-7.6 clients. When mux
     # is enabled it reuses one session per (user,host,port) for the script's
     # lifetime; if a master can't open, auto-mode degrades to a direct connection.
-    local base_ssh="ssh $SSH_HOSTKEY_OPT -o ConnectTimeout=10 $SSH_MUX_OPTS"
+    # BatchMode=yes: every ssh call here runs in a background job with nobody to
+    # type a password. Without it, a rejected key makes ssh wait on a prompt until
+    # the 15s timeout kills it, which reports as "Connection timeout" instead of
+    # "authentication failed".
+    local base_ssh="ssh $SSH_HOSTKEY_OPT -o BatchMode=yes -o ConnectTimeout=10 $SSH_MUX_OPTS"
     if [[ -n "${SERVER_PORTS[$server]}" ]]; then
         echo "$base_ssh -p ${SERVER_PORTS[$server]}"
     else

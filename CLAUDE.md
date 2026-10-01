@@ -682,9 +682,9 @@ since 2.x), which is why even an ancient target like CentOS 6 is fine to manage.
 | Host key policy | `StrictHostKeyChecking=accept-new` | 7.6 | `StrictHostKeyChecking=no` |
 | Connection multiplexing | `ControlMaster=auto` + `ControlPath=$TEMP_DIR/ssh-cm/cm-%C` + `ControlPersist=600` | 6.7 (`%C` token) | multiplexing disabled (one handshake per command) |
 
-`ConnectTimeout=10` is always present. The resulting command for a modern
+`BatchMode=yes` and `ConnectTimeout=10` are always present. `BatchMode` makes a rejected key fail at once as an authentication error, not hang on a password prompt until the 15-second probe timeout. The resulting command for a modern
 controller is:
-`ssh -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 -o ControlMaster=auto -o ControlPath=$TEMP_DIR/ssh-cm/cm-%C -o ControlPersist=600 [-p PORT]`
+`ssh -o StrictHostKeyChecking=accept-new -o BatchMode=yes -o ConnectTimeout=10 -o ControlMaster=auto -o ControlPath=$TEMP_DIR/ssh-cm/cm-%C -o ControlPersist=600 [-p PORT]`
 
 Effective controller matrix:
 - **RHEL/Rocky/Alma 8+, Debian 10+, Ubuntu 18.04+** (≥7.6): accept-new + pooling
