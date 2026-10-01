@@ -76,6 +76,12 @@ DASHBOARD_WIDTH="${DASHBOARD_WIDTH:-}"
 # updates on old/slow hardware routinely exceed 10 minutes, and killing a
 # package transaction mid-flight risks rpmdb/dpkg corruption.
 APPLY_TIMEOUT=3600
+# CONNECT_ATTEMPTS: Total connection attempts in Phase 1 (default: 3). A server
+# that closes the connection during the SSH banner exchange
+# (ssh_exchange_identification) often accepts the next attempt. 1 disables retry.
+CONNECT_ATTEMPTS=3
+# CONNECT_RETRY_DELAY: Seconds to wait between connection attempts (default: 3)
+CONNECT_RETRY_DELAY=3
 
 # Function to safely load configuration file
 # This prevents arbitrary code execution by only parsing specific variable assignments
@@ -93,7 +99,7 @@ load_config() {
     fi
 
     # Whitelist of allowed configuration variables
-    local allowed_vars=("DNF_TIMEOUT" "APPLY_TIMEOUT" "KERNEL_PACKAGE_REGEX" "KERNEL_UPDATE_REGEX" "REBOOT_MAX_WAIT" "REBOOT_WAIT_INTERVAL" "DASHBOARD_REFRESH" "DASHBOARD_WIDTH")
+    local allowed_vars=("DNF_TIMEOUT" "APPLY_TIMEOUT" "KERNEL_PACKAGE_REGEX" "KERNEL_UPDATE_REGEX" "REBOOT_MAX_WAIT" "REBOOT_WAIT_INTERVAL" "DASHBOARD_REFRESH" "DASHBOARD_WIDTH" "CONNECT_ATTEMPTS" "CONNECT_RETRY_DELAY")
 
     # Parse config file safely - only allow whitelisted variable assignments.
     # The `|| [[ -n "$key" ]]` guard still processes a final line that lacks a
@@ -126,7 +132,7 @@ load_config() {
                 fi
 
                 # Validate numeric values
-                if [[ "$key" =~ TIMEOUT|WAIT|REFRESH ]]; then
+                if [[ "$key" =~ TIMEOUT|WAIT|REFRESH|CONNECT_ ]]; then
                     if ! [[ "$value" =~ ^[0-9]+$ ]]; then
                         echo -e "${YELLOW}[WARNING]${NC} Invalid numeric value for $key in config file. Using default."
                         continue
@@ -134,6 +140,11 @@ load_config() {
                     # Reject unreasonably large values (1 week = 604800 seconds max)
                     if [[ "$value" -gt 604800 ]]; then
                         echo -e "${YELLOW}[WARNING]${NC} Value for $key is too large (max: 604800 seconds). Using default."
+                        continue
+                    fi
+                    # Cap attempts: 1000 retries is a typo, not a plan
+                    if [[ "$key" == "CONNECT_ATTEMPTS" && "$value" -gt 20 ]]; then
+                        echo -e "${YELLOW}[WARNING]${NC} Value for $key is too large (max: 20). Using default."
                         continue
                     fi
                     # Reject zero: REBOOT_WAIT_INTERVAL=0 would divide by zero
@@ -818,6 +829,7 @@ classify_ssh_error() {
 
     SSH_ERROR_REASON=""
     case "$err" in
+        *"exchange_identification"*)            SSH_ERROR_REASON="SSH banner exchange failed" ;;
         *"Permission denied"*)                  SSH_ERROR_REASON="auth failed" ;;
         *"no matching"*)                        SSH_ERROR_REASON="SSH algorithm mismatch (legacy host?)" ;;
         *"IDENTIFICATION HAS CHANGED"*)         SSH_ERROR_REASON="host key changed" ;;
@@ -1300,7 +1312,7 @@ draw_dashboard() {
             *"Complete"*) color="${GREEN}"; ((n_done++)) ;;
             *"Skipped"*|*"Displayed"*) color="${YELLOW}"; ((n_done++)) ;;
             *"Updating"*|*"Applying"*) color="${MAGENTA}"; ((n_active++)) ;;
-            *"Rebooting"*) color="${YELLOW}"; ((n_active++)) ;;
+            *"Rebooting"*|*"retrying"*) color="${YELLOW}"; ((n_active++)) ;;
             *"Connected"*) color="${GREEN}"; ((n_active++)) ;;
             *) color="${CYAN}"; ((n_active++)) ;;
         esac
@@ -1879,8 +1891,23 @@ check_server_updates() {
 
     # Single round-trip: connection test + package-manager detection + OS/kernel.
     # Writes the pkg_manager/os_release/kernel temp files as a side effect.
-    probe_server_info "$server"
-    local probe_rc=$?
+    # A server that drops the connection during the SSH banner exchange
+    # (ssh_exchange_identification) often accepts the next attempt, so retry
+    # that one error up to CONNECT_ATTEMPTS times. Other failures end at once.
+    local probe_rc attempt=1
+    while true; do
+        probe_server_info "$server"
+        probe_rc=$?
+        if [[ $probe_rc -ne 1 || $attempt -ge $CONNECT_ATTEMPTS ]] ||
+           ! grep -q "exchange_identification" "$TEMP_DIR/${server}.ssh_err" 2>/dev/null; then
+            break
+        fi
+        echo "$(date) - $server: ssh_exchange_identification, retry $attempt/$((CONNECT_ATTEMPTS - 1)) in ${CONNECT_RETRY_DELAY}s" >> "$LOG_FILE"
+        update_status "$server" "Connection dropped - retrying ($((attempt + 1))/$CONNECT_ATTEMPTS)..."
+        sleep "$CONNECT_RETRY_DELAY"
+        update_status "$server" "Checking connection (attempt $((attempt + 1))/$CONNECT_ATTEMPTS)..."
+        attempt=$((attempt + 1))
+    done
     if [[ $probe_rc -eq 124 ]]; then
         update_status "$server" "ERROR: Connection timeout"
         echo "$(date) - ERROR: Connection timeout to $server (15s)" >> "$LOG_FILE"

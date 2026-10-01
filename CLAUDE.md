@@ -494,6 +494,8 @@ DASHBOARD_REFRESH=1                # Dashboard update interval (seconds)
 DASHBOARD_WIDTH=160                # Force dashboard width, 40-1000 (default: auto)
 REBOOT_MAX_WAIT=900                # Maximum reboot wait time (seconds)
 REBOOT_WAIT_INTERVAL=30            # Seconds between reboot checks
+CONNECT_ATTEMPTS=3                 # Phase 1 connection attempts (1-20); retries only ssh_exchange_identification
+CONNECT_RETRY_DELAY=3              # Seconds between connection attempts
 KERNEL_PACKAGE_REGEX="..."         # Kernel detection (dnf/yum only)
 KERNEL_UPDATE_REGEX="..."          # Kernel update detection (dnf/yum only)
 ```
@@ -737,6 +739,14 @@ Log file created with 600 permissions. Warns if log exceeds 10MB.
 ## Version History
 
 ### Unreleased (post-1.4)
+
+**Connection retry (2026-10-01):**
+- `check_server_updates()` retries the Phase 1 probe up to `CONNECT_ATTEMPTS`
+  times (default 3) when ssh stderr contains `exchange_identification`
+  (`ssh_exchange_identification` on old OpenSSH, `kex_exchange_identification`
+  on new). The server often accepts the next attempt. Other failures
+  (auth, refused, timeout) fail at once. The dashboard row shows
+  `Connection dropped - retrying (2/3)...` in yellow, and each retry is logged
 
 **External audit fixes (2026-08-25):**
 - **Ctrl-C now stops the run.** `trap cleanup EXIT INT TERM` had no `exit`, and
