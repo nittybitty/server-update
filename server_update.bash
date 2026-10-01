@@ -78,7 +78,8 @@ DASHBOARD_WIDTH="${DASHBOARD_WIDTH:-}"
 APPLY_TIMEOUT=3600
 # CONNECT_ATTEMPTS: Total connection attempts in Phase 1 (default: 3). A server
 # that closes the connection during the SSH banner exchange
-# (ssh_exchange_identification) often accepts the next attempt. 1 disables retry.
+# (ssh_exchange_identification) or times out often accepts the next attempt.
+# 1 disables retry.
 CONNECT_ATTEMPTS=3
 # CONNECT_RETRY_DELAY: Seconds to wait between connection attempts (default: 3)
 CONNECT_RETRY_DELAY=3
@@ -1892,17 +1893,27 @@ check_server_updates() {
     # Single round-trip: connection test + package-manager detection + OS/kernel.
     # Writes the pkg_manager/os_release/kernel temp files as a side effect.
     # A server that drops the connection during the SSH banner exchange
-    # (ssh_exchange_identification) often accepts the next attempt, so retry
-    # that one error up to CONNECT_ATTEMPTS times. Other failures end at once.
-    local probe_rc attempt=1
+    # (ssh_exchange_identification) or times out (probe exit 124, or ssh
+    # "Connection timed out") often accepts the next attempt, so retry those
+    # errors up to CONNECT_ATTEMPTS times. Other failures end at once.
+    local probe_rc attempt=1 retry_reason
     while true; do
         probe_server_info "$server"
         probe_rc=$?
-        if [[ $probe_rc -ne 1 || $attempt -ge $CONNECT_ATTEMPTS ]] ||
-           ! grep -q "exchange_identification" "$TEMP_DIR/${server}.ssh_err" 2>/dev/null; then
+        retry_reason=""
+        if [[ $probe_rc -eq 124 ]]; then
+            retry_reason="connection timeout"
+        elif [[ $probe_rc -eq 1 ]]; then
+            if grep -q "exchange_identification" "$TEMP_DIR/${server}.ssh_err" 2>/dev/null; then
+                retry_reason="ssh_exchange_identification"
+            elif grep -qi "timed out" "$TEMP_DIR/${server}.ssh_err" 2>/dev/null; then
+                retry_reason="connection timed out"
+            fi
+        fi
+        if [[ -z "$retry_reason" || $attempt -ge $CONNECT_ATTEMPTS ]]; then
             break
         fi
-        echo "$(date) - $server: ssh_exchange_identification, retry $attempt/$((CONNECT_ATTEMPTS - 1)) in ${CONNECT_RETRY_DELAY}s" >> "$LOG_FILE"
+        echo "$(date) - $server: $retry_reason, retry $attempt/$((CONNECT_ATTEMPTS - 1)) in ${CONNECT_RETRY_DELAY}s" >> "$LOG_FILE"
         update_status "$server" "Connection dropped - retrying ($((attempt + 1))/$CONNECT_ATTEMPTS)..."
         sleep "$CONNECT_RETRY_DELAY"
         update_status "$server" "Checking connection (attempt $((attempt + 1))/$CONNECT_ATTEMPTS)..."
